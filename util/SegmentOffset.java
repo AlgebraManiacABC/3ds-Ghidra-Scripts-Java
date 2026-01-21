@@ -1,3 +1,5 @@
+package util;
+
 import ghidra.program.model.address.Address;
 
 public class SegmentOffset {

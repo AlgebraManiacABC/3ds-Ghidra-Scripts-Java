@@ -1,20 +1,47 @@
-//@category 3DS
+package util;//@category 3DS
 // Not a script - utility helper - AlgebraManiacABC
 
-import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
-import ghidra.app.services.ProgramManager;
-import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.Program;
-import ghidra.program.model.mem.Memory;
-import ghidra.program.model.mem.MemoryAccessException;
-import ghidra.program.model.mem.MemoryBlock;
-import ghidra.program.model.symbol.*;
-import ghidra.util.task.TaskMonitor;
-
+import java.io.*;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
+import java.nio.charset.StandardCharsets;
+
+import ghidra.app.script.GhidraScript;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
+import ghidra.app.services.ProgramManager;
+import ghidra.program.model.symbol.EquateTable;
+import ghidra.program.model.listing.BookmarkType;
+import ghidra.program.model.listing.Bookmark;
+import ghidra.program.model.listing.BookmarkManager;
+import ghidra.feature.fid.service.FidService;
+import ghidra.app.util.demangler.*;
+import ghidra.framework.model.*;
+import ghidra.program.model.address.*;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.*;
+import ghidra.program.model.symbol.*;
+import ghidra.util.task.TaskMonitor;
+import util.*;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.util.exception.*;
+import ghidra.program.model.symbol.EquateTable;
+import ghidra.program.model.listing.BookmarkType;
+import ghidra.feature.fid.service.FidService;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
+import ghidra.program.database.ProgramContentHandler;
+import ghidra.program.model.listing.*;
+import ghidra.util.Msg;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.exception.VersionException;
 
 public class ThreeDSUtils {
     public static int getInt(byte[] arr, long off) {
@@ -88,12 +115,12 @@ public class ThreeDSUtils {
 
     public static List<RelocationEntry> getAndApplyRelocs(
             byte[] arr, long off, CROLibrary croLibrary, Program srcProgram,
-            SegmentOffset symbolOffset, SegmentBlock[] segments,
+            SegmentOffset symbolOffset, SegmentBlock[] segments, GhidraScript script,
             ProgramManager pman, ReferenceManager rman, TaskMonitor monitor) throws Exception {
 
         // Open program in background during processing
         URL croPath = croLibrary.croFile.getLocalProjectURL(null);
-        Program croProgram = pman.openCachedProgram(croPath, croLibrary);
+        Program croProgram = pman.openCachedProgram(croPath, script);
 
         // This is the address of the symbol, which will be patched
         //  into the crs several times
@@ -115,19 +142,10 @@ public class ThreeDSUtils {
             }
             croProgram.endTransaction(tx_id, true);
             if (adc.getDisassembledAddressSet() == null) {
-//                printf("No symbol at address %s in %s, and couldn't disassemble!\n",
-//                        symbolAddress, croLibrary.name);
-            } else {
-                symbols = croProgram.getSymbolTable().getSymbols(symbolAddress);
+                script.printf("No symbol at address %s in %s, and couldn't disassemble!\n",
+                        symbolAddress, croLibrary.getName());
+                script.createBookmark(symbolAddress, BookmarkType.ANALYSIS, "Export symbol found here");
             }
-        }
-
-        if (symbols.length > 1) {
-//            printf("More than 1 symbol for address %s in %s! Picking first.\n",
-//                    symbolAddress, croLibrary.name);
-            symName = symbols[0].getName();
-        } else if (symbols.length == 1) {
-            symName = symbols[0].getName();
         }
 
         List<RelocationEntry> relocs = ThreeDSUtils.getRelocs(arr, off);
@@ -136,10 +154,10 @@ public class ThreeDSUtils {
                 // This is the location which will be patched by the value from symbolAddress
                 Address crsAddress = patchAddress.off.getAddr(segments);
 
-                if (symName == null) symName =
-                        String.format("%s_%s",croLibrary.name,symbolAddress);
+                if (symName == null) {
+                    symName = String.format("%s_%s",croLibrary.getName(),symbolAddress);
+                }
                 ThreeDSUtils.labelNamedData(symName, crsAddress, srcProgram);
-//                printf("Creating reference to %s at %s\n", symbolAddress, crsAddress);
                 // Link back into library
                 rman.addExternalReference(
                         crsAddress,
@@ -150,13 +168,13 @@ public class ThreeDSUtils {
                         0,
                         RefType.DATA);
             } else {
-//                printf("\tFrom %s @ %s to %s (%s) - NOT YET IMPLEMENTED\n",
-//                        croLibrary.name, symbolOffset, patchAddress.off, patchAddress.type);
+                script.printf("\tFrom %s @ %s to %s (%s) - NOT YET IMPLEMENTED\n",
+                        croLibrary.name, symbolOffset, patchAddress.off, patchAddress.type);
             }
         }
 
         // Release program
-        croProgram.release(croLibrary);
+        croProgram.release(script);
 
         return relocs;
     }

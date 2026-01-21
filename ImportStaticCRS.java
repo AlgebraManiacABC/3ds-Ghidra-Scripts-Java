@@ -16,6 +16,7 @@ import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.symbol.*;
+import util.*;
 
 public class ImportStaticCRS extends GhidraScript {
 
@@ -285,7 +286,7 @@ public class ImportStaticCRS extends GhidraScript {
                 // Get managers
                 ProgramManager pman = getState().getTool().getService(ProgramManager.class);
                 ReferenceManager rman = currentProgram.getReferenceManager();
-                ThreeDSUtils.getAndApplyRelocs(crs, relocsOff, croLibrary, currentProgram, symbolOffset, segments, pman, rman, monitor);
+                ThreeDSUtils.getAndApplyRelocs(crs, relocsOff, croLibrary, currentProgram, symbolOffset, segments, this, pman, rman, monitor);
             }
         }
 //        printf("Imported %s relocation names!\n", relocation_sum);
