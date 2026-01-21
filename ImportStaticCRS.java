@@ -3,9 +3,7 @@
 //@category 3DS
 
 import java.io.*;
-import java.net.URL;
 import java.util.*;
-import java.nio.*;
 import java.nio.charset.StandardCharsets;
 
 import ghidra.app.script.GhidraScript;
@@ -26,8 +24,6 @@ public class ImportStaticCRS extends GhidraScript {
         for(; end < arr.length && arr[(int)end] != 0; end++);
         return new String(arr, (int)off, (int)(end - off), StandardCharsets.UTF_8);
     }
-
-
 
     List<CROLibrary> getCROLibraries(DomainFolder croDirectory) throws Exception {
         DomainFile[] found = Arrays.stream(croDirectory.getFiles())
@@ -86,30 +82,24 @@ public class ImportStaticCRS extends GhidraScript {
             } else {
                 // Split start
                 if (curBlock.getStart().compareTo(seg.getStart()) != 0) {
-                    Address toSplit = seg.getStart();//.subtract(curBlock.getStart().getOffset());
-//                    printf("About to split at %s at start of %s\n", toSplit, seg);
+                    Address toSplit = seg.getStart();
                     memory.split(curBlock, toSplit);
-//                    println("Splat");
                     curBlock = memory.getBlock(seg.getStart());
                 }
                 // Split end
                 if (curBlock.getEnd().add(1).compareTo(seg.getEnd()) != 0) {
                     if (!curBlock.contains(seg.getEnd())) {
                         // Need to make a new block, then join
-//                        printf("Adding extra memory to make room for %s", seg);
                         MemoryBlock toJoin = memory.createBlock(curBlock, "temp", curBlock.getEnd().add(1), seg.getSize() - curBlock.getSize());
                         memory.join(curBlock, toJoin);
-//                        println("Added");
                     } else {
-//                        printf("About to split at %s on end of %s\n", seg.getEnd(), seg);
                         memory.split(curBlock, seg.getEnd());
-//                        println("Splat");
                     }
                 }
-                // Start and end split successfully. Rename
-//                printf("Renaming curBlock (%s) to %s\n", curBlock.getName(), seg.idAsString());
+                // Start and end split successfully.
             }
-            switch(SegmentOffset.ID.values()[seg.id]) {
+            // Set RWX
+            switch(SegmentOffset.ID.values()[seg.getID()]) {
                 case SegmentOffset.ID.TEXT ->
                         curBlock.setPermissions(true, false, true);
                 case SegmentOffset.ID.RODATA ->
@@ -119,9 +109,10 @@ public class ImportStaticCRS extends GhidraScript {
                 default ->
                         throw new Exception("FAILURE TO GET SEGMENT INDEX!!!");
             }
+            // Rename
             curBlock.setName(seg.idAsString());
         }
-        // Now, remove any spaces in between
+        // Now, remove any gaps in between
         for (MemoryBlock block : memory.getBlocks()) {
             if (block.getName().contains("split")) {
                 memory.removeBlock(block, monitor);
@@ -284,7 +275,7 @@ public class ImportStaticCRS extends GhidraScript {
                 SegmentOffset symbolOffset = new SegmentOffset(crs, anonOff + 0x8L * j);
                 int relocsOff = ThreeDSUtils.getInt(crs, anonOff + 0x4 + (0x8L * j));
                 CROLibrary croLibrary = croLibraries.stream()
-                        .filter(l -> l.name.toLowerCase().equals(croName.toLowerCase() + ".cro"))
+                        .filter(l -> l.getName().toLowerCase().equals(croName.toLowerCase() + ".cro"))
                         .findFirst().orElse(null);
                 if (croLibrary == null) {
                     throw new NullPointerException(

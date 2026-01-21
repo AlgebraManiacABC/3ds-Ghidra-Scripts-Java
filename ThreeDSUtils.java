@@ -1,11 +1,9 @@
+//@category 3DS
 // Not a script - utility helper - AlgebraManiacABC
 
 import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
-import ghidra.app.script.GhidraState;
 import ghidra.app.services.ProgramManager;
-import ghidra.framework.model.DomainFile;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.Library;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
@@ -19,12 +17,12 @@ import java.nio.ByteOrder;
 import java.util.*;
 
 public class ThreeDSUtils {
-    static int getInt(byte[] arr, long off) {
+    public static int getInt(byte[] arr, long off) {
         return ByteBuffer.wrap(arr, (int) off, 4)
                 .order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
-    static void labelNamedData(String name, SegmentOffset off, SegmentBlock[] segments, Program program) throws Exception {
+    public static void labelNamedData(String name, SegmentOffset off, SegmentBlock[] segments, Program program) throws Exception {
         Address addr = off.getAddr(segments);
         if (addr != null) {
             SymbolTable symbolTable = program.getSymbolTable();
@@ -61,7 +59,7 @@ public class ThreeDSUtils {
         return bytes;
     }
 
-    static SegmentBlock[] readSegments(byte[] crx, Program program) {
+    public static SegmentBlock[] readSegments(byte[] crx, Program program) {
         int segTableOffset = ThreeDSUtils.getInt(crx, 0xC8);
         int segCount = ThreeDSUtils.getInt(crx, 0xCC);
         SegmentBlock[] segments = new SegmentBlock[segCount];
@@ -72,7 +70,7 @@ public class ThreeDSUtils {
         return segments;
     }
 
-    static List<RelocationEntry> getRelocs(byte[] arr, long off) {
+    public static List<RelocationEntry> getRelocs(byte[] arr, long off) {
         List<RelocationEntry> relocs = new ArrayList<>();
 
         int i = 0;
@@ -88,7 +86,7 @@ public class ThreeDSUtils {
         return relocs;
     }
 
-    static List<RelocationEntry> getAndApplyRelocs(
+    public static List<RelocationEntry> getAndApplyRelocs(
             byte[] arr, long off, CROLibrary croLibrary, Program srcProgram,
             SegmentOffset symbolOffset, SegmentBlock[] segments,
             ProgramManager pman, ReferenceManager rman, TaskMonitor monitor) throws Exception {
@@ -164,149 +162,4 @@ public class ThreeDSUtils {
     }
 
 
-}
-
-class SegmentBlock {
-    Address segmentStart;
-    long segmentSize;
-    int id;
-
-    SegmentBlock(Address start, long size, int id) {
-        this.segmentStart = start;
-        this.segmentSize = size;
-        this.id = id;
-    }
-
-    SegmentBlock(byte[] arr, int offset, Program program) {
-        // read the segment table entry:
-        segmentStart = program.getAddressFactory().getDefaultAddressSpace().getAddress((ThreeDSUtils.getInt(arr, offset)));
-        segmentSize = ThreeDSUtils.getInt(arr, offset + 4);
-        id = ThreeDSUtils.getInt(arr, offset + 8);
-    }
-
-    Address getStart() { return segmentStart; }
-    long getSize() { return segmentSize; }
-    Address getEnd() { return segmentStart.add(segmentSize); }
-
-    public String toString() {
-        return String.format("%s: %s (%08x)", idAsString(), segmentStart, segmentSize);
-    }
-
-    public String idAsString() {
-        return switch(id) {
-            case 0 -> ".text";
-            case 1 -> ".rodata";
-            case 2 -> ".data";
-            case 3 -> ".bss";
-            default -> "unknown section";
-        };
-    }
-}
-
-class SegmentOffset {
-    SegmentOffset.ID segmentIndex;
-    int segmentOffset;
-
-    public enum ID {
-        TEXT,
-        RODATA,
-        DATA,
-        BSS,
-        INVALID
-    }
-
-    SegmentOffset(long val) {
-        if (val == 0xFFFFFFFFL) {
-            this.segmentIndex = SegmentOffset.ID.INVALID;
-            this.segmentOffset = 0;
-        } else {
-            this.segmentIndex = SegmentOffset.ID.values()[(int)(val & 0xf)];
-            this.segmentOffset = (int)(val >> 4);
-        }
-    }
-
-    SegmentOffset(byte[] arr, long off) {
-        this(ThreeDSUtils.getInt(arr,off) & 0xFFFFFFFFL);
-    }
-
-    SegmentOffset.ID getIndex() { return segmentIndex; }
-    int getOffset() { return segmentOffset; }
-
-    public String toString() {
-        if (segmentIndex == SegmentOffset.ID.INVALID) return "N/A";
-        return String.format("%s:%08x",segmentIndex,segmentOffset);
-    }
-
-    Address getAddr(SegmentBlock[] segments) {
-        for (SegmentBlock segment : segments) {
-            if (segment.id != segmentIndex.ordinal()) continue;
-            return segment.getStart().add(segmentOffset);
-        }
-        return null;
-    }
-}
-
-class RelocationEntry {
-    enum Type {
-        R_ARM_NONE((byte) 0),
-        R_ARM_ABS32((byte) 2),
-        R_ARM_REL32((byte) 3),
-        R_ARM_THM_PC22((byte) 10),
-        R_ARM_CALL((byte) 28),
-        R_ARM_JUMP24((byte) 29),
-        R_ARM_TARGET1((byte) 38),
-        R_ARM_PREL31((byte) 42);
-
-        public final byte i;
-        private static final Map<Byte, Type> BY_VALUE = new HashMap<>();
-
-        static {
-            for (Type t : values()) {
-                BY_VALUE.put(t.i, t);
-            }
-        }
-        Type(byte i) {
-            this.i = i;
-        }
-        static Type typeOf(byte b) {
-            Type type = BY_VALUE.get(b);
-            if (type == null) {
-                throw new IllegalArgumentException("Unknown relocation type: " + b);
-            }
-            return type;
-        }
-    }
-
-    SegmentOffset off;
-    Type type;
-
-    RelocationEntry(SegmentOffset off, Type type) {
-        this.off = off;
-        this.type = type;
-    }
-
-    public String toString() {
-        return String.format("%s: %s", type, off);
-    }
-}
-
-class CROLibrary {
-    Library library;
-    DomainFile croFile;
-    SegmentBlock[] segments;
-    String name;
-
-    CROLibrary(DomainFile croFile, Program program, ProgramManager pman) throws Exception {
-        this.croFile = croFile;
-        ExternalManager exman = program.getExternalManager();
-        this.library = exman.addExternalLibraryName(croFile.getName(), SourceType.IMPORTED);
-        exman.setExternalPath(this.library.getName(), croFile.getPathname(), true);
-
-        Program croProgram = pman.openCachedProgram(croFile, this);
-        byte[] croBytes = ThreeDSUtils.getAllBytes(croProgram);
-        this.segments = ThreeDSUtils.readSegments(croBytes, croProgram);
-        croProgram.release(this);
-
-        this.name = croFile.getName();
-    }
 }
