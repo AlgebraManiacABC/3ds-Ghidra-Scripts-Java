@@ -1,5 +1,5 @@
-package util;//@category 3DS
 // Not a script - utility helper - AlgebraManiacABC
+package util;
 
 import java.net.URL;
 import java.nio.ByteBuffer;
