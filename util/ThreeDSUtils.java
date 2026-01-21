@@ -1,47 +1,20 @@
 package util;//@category 3DS
 // Not a script - utility helper - AlgebraManiacABC
 
-import java.io.*;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
-import java.nio.charset.StandardCharsets;
 
 import ghidra.app.script.GhidraScript;
-import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
 import ghidra.app.services.ProgramManager;
-import ghidra.program.model.symbol.EquateTable;
-import ghidra.program.model.listing.BookmarkType;
-import ghidra.program.model.listing.Bookmark;
-import ghidra.program.model.listing.BookmarkManager;
-import ghidra.feature.fid.service.FidService;
-import ghidra.app.util.demangler.*;
-import ghidra.framework.model.*;
-import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
-import util.*;
-import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.mem.Memory;
-import ghidra.program.model.mem.MemoryAccessException;
-import ghidra.program.model.listing.Function;
 import ghidra.program.model.symbol.SourceType;
-import ghidra.util.exception.*;
-import ghidra.program.model.symbol.EquateTable;
-import ghidra.program.model.listing.BookmarkType;
-import ghidra.feature.fid.service.FidService;
-import ghidra.framework.model.DomainFile;
-import ghidra.framework.model.DomainFolder;
-import ghidra.program.database.ProgramContentHandler;
-import ghidra.program.model.listing.*;
-import ghidra.util.Msg;
-import ghidra.util.exception.CancelledException;
-import ghidra.util.exception.VersionException;
 
 public class ThreeDSUtils {
     public static int getInt(byte[] arr, long off) {
