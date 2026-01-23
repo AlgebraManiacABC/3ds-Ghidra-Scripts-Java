@@ -205,13 +205,12 @@ public class ImportStaticCRS extends GhidraScript {
         labelOnExitLoadUnresolved(crs, segments);
 
         // Exports
-        int namedExportTableOff = ThreeDSUtils.getInt(crs, 0xD0);
-        int namedExportTableNum = ThreeDSUtils.getInt(crs, 0xD4);
-        printf("Named Export Table (%d): %08x\n",namedExportTableNum,namedExportTableOff);
         int indexedExportTableOff = ThreeDSUtils.getInt(crs, 0xD8);
         int indexedExportTableNum = ThreeDSUtils.getInt(crs, 0xDC);
         printf("Indexed Export Table (%d): %08x\n",indexedExportTableNum,indexedExportTableOff);
 
+        int namedExportTableOff = ThreeDSUtils.getInt(crs, 0xD0);
+        int namedExportTableNum = ThreeDSUtils.getInt(crs, 0xD4);
         for(int i=0; i<namedExportTableNum; i++) {
             String name = getName(crs, ThreeDSUtils.getInt(crs,namedExportTableOff + 8L * i));
             SegmentOffset off = new SegmentOffset(crs, namedExportTableOff + (8L * i) + 4);

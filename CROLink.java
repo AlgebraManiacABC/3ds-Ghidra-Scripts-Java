@@ -34,25 +34,29 @@ public class CROLink extends GhidraScript {
     protected void run() throws Exception {
         // This script will link all cro's and the crs together.
 
-        // Make a list/array of crx, with index 0 as the |static| module
+        // Get pertinent files, and form .crx into proper CRXLibrary objects
         DomainFile codeFile = askDomainFile("Select the static module (code.bin / .code)");
         File crsFile = askFile("Select static.crs","OK");
         DomainFolder croFolder = askProjectFolder("Select the cro directory");
         ProgramManager pman = getState().getTool().getService(ProgramManager.class);
-//        crxLibraries.add(new CRXLibrary(codeFile, crsFile, pman));
-//        for (DomainFile cro : croFolder.getFiles()) {
-//            crxLibraries.add(new CRXLibrary(cro, pman));
-//        }
+        crxLibraries.add(new CRXLibrary(codeFile, crsFile, pman, monitor));
+        for (DomainFile cro : croFolder.getFiles()) {
+            crxLibraries.add(new CRXLibrary(cro, pman, monitor));
+        }
 
-        // Iterate through the list, linking i with i+j for i = 0..n and for j = i..n
-        // Once iteration completes, all modules have been linked!
+        // Iterate through the list, linking each module to its imports
+        for (CRXLibrary crx : crxLibraries) crx.link();
+
+        // All modules have been linked!
+        printf("%d modules linked successfully!\n", crxLibraries.size());
     }
 }
 
 class CRXLibrary {
+
+    private boolean isStatic = false;
     SegmentBlock[] segments;
     byte[] crxBytes;
-//    private GhidraScript script;
     private final ProgramManager pman;
     private final TaskMonitor monitor;
 
@@ -60,7 +64,7 @@ class CRXLibrary {
     //  to get crx information
     private final DomainFile file;
 
-    // Assume this is always uninitialized
+    // Assume this is always uninitialized at function start
     private Program program;
 
     void startUsingProgram() {
@@ -82,6 +86,7 @@ class CRXLibrary {
 
     CRXLibrary(DomainFile codeFile, File crsFile,
                ProgramManager pman, TaskMonitor monitor) throws Exception {
+        isStatic = true;
         file = codeFile;
         this.pman = pman;
         this.monitor = monitor;
@@ -103,7 +108,7 @@ class CRXLibrary {
     }
 
     boolean disassemble(Address addr, boolean thumb) {
-        ArmDisassembleCommand adc = new ArmDisassembleCommand(addr, null, thumb);
+        var adc = new ArmDisassembleCommand(addr, null, thumb);
         startTransactingProgram(String.format("Disassembling %s...",file));
         try {
             adc.applyTo(program, monitor);
@@ -113,6 +118,22 @@ class CRXLibrary {
         }
         stopTransactingProgram(true);
         return (adc.getDisassembledAddressSet() != null);
+    }
+
+    // Demangle names
+    void demangleAll() throws Exception {
+        startUsingProgram();
+            var options = new DemanglerOptions();
+            options.setApplySignature(true);
+            for (Symbol symbol : program.getSymbolTable().getAllSymbols(true)) {
+                String name = symbol.getName();
+                Address addr = symbol.getAddress();
+                List<DemangledObject> demangledObjects = DemanglerUtil.demangle(program, name, addr);
+                if (!demangledObjects.isEmpty()) {
+                    demangledObjects.getFirst().applyTo(program, addr, new DemanglerOptions(), monitor);
+                }
+            }
+        stopUsingProgram();
     }
 
     boolean applyNameHere(String name, SegmentOffset segOff,
@@ -135,7 +156,7 @@ class CRXLibrary {
         Function temp = program.getListing().getFunctionAt(addr);
         // If not a function entrypoint, can we make it one?
         if (temp == null) {
-            CreateFunctionCmd cfc = new CreateFunctionCmd(name, addr, null, SourceType.IMPORTED);
+            var cfc = new CreateFunctionCmd(name, addr, null, SourceType.IMPORTED);
             startTransactingProgram("Creating function...");
             try {
                 cfc.applyTo(program, monitor);
@@ -167,7 +188,8 @@ class CRXLibrary {
         stopUsingProgram();
     }
 
-    void link() {
-
+    void link() throws Exception {
+        applyExportedNames();
+        demangleAll();
     }
 }
