@@ -4,7 +4,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 public class RelocationEntry {
-    enum Type {
+    public enum Type {
         R_ARM_NONE((byte) 0),
         R_ARM_ABS32((byte) 2),
         R_ARM_REL32((byte) 3),
@@ -34,8 +34,8 @@ public class RelocationEntry {
         }
     }
 
-    SegmentOffset off;
-    Type type;
+    public SegmentOffset off;
+    public Type type;
 
     RelocationEntry(SegmentOffset off, Type type) {
         this.off = off;
