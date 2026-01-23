@@ -18,13 +18,10 @@ import ghidra.program.model.mem.*;
 import ghidra.program.model.symbol.*;
 import util.*;
 
-public class ImportStaticCRS extends GhidraScript {
+import static util.ThreeDSUtils.getAllBytes;
+import static util.ThreeDSUtils.getName;
 
-    String getName(byte[] arr, long off) {
-        long end = off;
-        for(; end < arr.length && arr[(int)end] != 0; end++);
-        return new String(arr, (int)off, (int)(end - off), StandardCharsets.UTF_8);
-    }
+public class ImportStaticCRS extends GhidraScript {
 
     List<CROLibrary> getCROLibraries(DomainFolder croDirectory) throws Exception {
         DomainFile[] found = Arrays.stream(croDirectory.getFiles())
@@ -176,12 +173,8 @@ public class ImportStaticCRS extends GhidraScript {
             return;
         }
 
-        File crs_file = askFile("Import static.crs","Import");
-        byte[] crs;
-        try (FileInputStream stream = new FileInputStream(crs_file)) {
-            crs = new byte[(int) crs_file.length()];
-            stream.read(crs);
-        }
+        File crsFile = askFile("Import static.crs","Import");
+        byte[] crs = getAllBytes(crsFile);
 
         // Next up:
         // Verify CRO file structure

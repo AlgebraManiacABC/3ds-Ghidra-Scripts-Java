@@ -1,9 +1,14 @@
 // Not a script - utility helper - AlgebraManiacABC
 package util;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 import ghidra.app.script.GhidraScript;
@@ -22,6 +27,12 @@ public class ThreeDSUtils {
                 .order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
+    public static String getName(byte[] arr, long off) {
+        long end = off;
+        for(; end < arr.length && arr[(int)end] != 0; end++);
+        return new String(arr, (int)off, (int)(end - off), StandardCharsets.UTF_8);
+    }
+
     public static void labelNamedData(String name, SegmentOffset off, SegmentBlock[] segments, Program program) throws Exception {
         Address addr = off.getAddr(segments);
         if (addr != null) {
@@ -30,12 +41,12 @@ public class ThreeDSUtils {
         }
     }
 
-    static void labelNamedData(String name, Address addr, Program program) throws Exception {
-        program.getSymbolTable().createLabel(addr, name, SourceType.IMPORTED);
+    public static Symbol labelNamedData(String name, Address addr, Program program) throws Exception {
+        return program.getSymbolTable().createLabel(addr, name, SourceType.IMPORTED);
     }
 
     // The program must be open
-    static byte[] getAllBytes(Program program) throws MemoryAccessException {
+    public static byte[] getAllBytes(Program program) throws MemoryAccessException {
         Memory memory = program.getMemory();
         int blockCount = memory.getAllFileBytes().size();
         MemoryBlock[] blocks = Arrays.stream(memory.getBlocks())
@@ -55,6 +66,16 @@ public class ThreeDSUtils {
         for (MemoryBlock block : blocks) {
             offset = (int) block.getStart().getOffset();
             block.getBytes(block.getStart(), bytes, offset, (int) block.getSize());
+        }
+        return bytes;
+    }
+
+    public static byte[] getAllBytes(File file) throws IOException {
+        byte[] bytes;
+        try (FileInputStream stream = new FileInputStream(file)) {
+            bytes = new byte[(int) file.length()];
+            int read = stream.read(bytes);
+            if (file.length() != read) throw new IOException("Byte count didn't match file size!");
         }
         return bytes;
     }

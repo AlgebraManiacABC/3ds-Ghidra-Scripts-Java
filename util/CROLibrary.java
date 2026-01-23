@@ -7,6 +7,8 @@ import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.ExternalManager;
 import ghidra.program.model.symbol.SourceType;
 
+import java.io.File;
+
 public class CROLibrary {
     Library library;
     DomainFile croFile;
