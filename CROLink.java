@@ -10,12 +10,10 @@ import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.demangler.*;
 import ghidra.framework.model.*;
-import ghidra.pcode.exec.AnnotatedPcodeUseropLibrary;
 import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import ghidra.util.exception.DuplicateNameException;
-import ghidra.util.exception.InvalidInputException;
 import ghidra.util.task.TaskMonitor;
 import util.*;
 
@@ -39,8 +37,17 @@ public class CROLink extends GhidraScript {
             crxLibraries.add(new CRXLibrary(cro, pman, monitor));
         }
 
+        for (CRXLibrary crx : crxLibraries) {
+            crx.importModules(crxLibraries);
+        }
         // Iterate through the list, linking each module to its imports
-        for (CRXLibrary crx : crxLibraries) crx.link(crxLibraries);
+        for (CRXLibrary crx : crxLibraries) {
+            crx.link(crxLibraries);
+        }
+        // Release hold of the programs
+        for (CRXLibrary crx : crxLibraries) {
+            crx.cleanup();
+        }
 
         // All modules have been linked!
         printf("%d modules linked successfully!\n", crxLibraries.size());
@@ -61,32 +68,13 @@ class CRXLibrary {
     //  to get crx information
     private final DomainFile file;
 
-    // Assume this is always uninitialized at function start
-    private Program program;
-
-    Program startUsingProgram() {
-        program = pman.openCachedProgram(file, this);
-        return program;
-    }
-
-    void stopUsingProgram() {
-        program.release(this);
-    }
-
-    private int tx_id;
-    void startTransactingProgram(String task) {
-        tx_id = program.startTransaction(task);
-    }
-
-    void stopTransactingProgram(boolean commit) {
-        program.endTransaction(tx_id, commit);
-    }
+    Program program;
 
     /**
      * Contains the Library corresponding to the respective
      *   program('s external manager) in the CRXLibrary
      */
-    private final HashMap<CRXLibrary, Library> libraries = new HashMap<>();
+    private final HashMap<String, Library> libraries = new HashMap<>();
 
     int hash() {
         return Objects.hash(name);
@@ -98,12 +86,11 @@ class CRXLibrary {
         file = codeFile;
         name = "|static|";
         this.pman = pman;
+        this.program = pman.openCachedProgram(codeFile, this);
         this.monitor = monitor;
-        startUsingProgram();
-            crxBytes = ThreeDSUtils.getAllBytes(crsFile);
-            segments = ThreeDSUtils.readSegments(crxBytes, program);
-            rman = program.getReferenceManager();
-        stopUsingProgram();
+        crxBytes = ThreeDSUtils.getAllBytes(crsFile);
+        segments = ThreeDSUtils.readSegments(crxBytes, program);
+        rman = program.getReferenceManager();
     }
 
     CRXLibrary(DomainFile croFile,
@@ -111,30 +98,34 @@ class CRXLibrary {
         file = croFile;
         name = croFile.getName().split("\\.cro")[0];
         this.pman = pman;
+        this.program = pman.openCachedProgram(croFile, this);
         this.monitor = monitor;
-        startUsingProgram();
-            crxBytes = ThreeDSUtils.getAllBytes(program);
-            segments = ThreeDSUtils.readSegments(crxBytes, program);
-            rman = program.getReferenceManager();
-        stopUsingProgram();
+        crxBytes = ThreeDSUtils.getAllBytes(program);
+        segments = ThreeDSUtils.readSegments(crxBytes, program);
+        rman = program.getReferenceManager();
+    }
+
+    void cleanup() {
+        program.release(this);
     }
 
     boolean disassemble(Address addr, boolean thumb) {
         var adc = new ArmDisassembleCommand(addr, null, thumb);
-        startTransactingProgram(String.format("Disassembling %s...",file));
+        int tx_id = program.startTransaction(String.format("Disassembling %s...",file));
         try {
             adc.applyTo(program, monitor);
         } catch (Exception e) {
-            stopTransactingProgram(false);
+            program.endTransaction(tx_id, false);
             throw e;
         }
-        stopTransactingProgram(true);
+        program.endTransaction(tx_id, true);
         return (adc.getDisassembledAddressSet() != null);
     }
 
     // Demangle names
     void demangleAll() throws Exception {
-        startUsingProgram();
+        int tx_id = program.startTransaction("Demangling");
+        try {
             var options = new DemanglerOptions();
             options.setApplySignature(true);
             for (Symbol symbol : program.getSymbolTable().getAllSymbols(true)) {
@@ -145,32 +136,44 @@ class CRXLibrary {
                     demangledObjects.getFirst().applyTo(program, addr, new DemanglerOptions(), monitor);
                 }
             }
-        stopUsingProgram();
+        } catch (Exception e) {
+            program.endTransaction(tx_id, false);
+            throw e;
+        }
+        program.endTransaction(tx_id, true);
     }
 
     public String getOrCreateNameHere(SegmentOffset segOff) throws Exception {
         Address addr = segOff.getAddr(segments);
-        String name = null;
-        startUsingProgram();
-            Symbol[] symbols = program.getSymbolTable().getSymbols(addr);
-            if (symbols.length == 0) {
-                // No symbol. Need to create one
-                if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
-                    // Create function, get name
-                    Function func = program.getListing()
-                            .createFunction(null, addr, null, SourceType.IMPORTED);
-                    name = func.getName();
-                } else {
-                    // Create global var
+        String name;
+        Symbol[] symbols = program.getSymbolTable().getSymbols(addr);
+        if (symbols.length == 0) {
+            // No symbol. Need to create one
+            if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
+                // Create function, get name
+                createFunctionHere(null, addr, program);
+                Function func = program.getListing().getFunctionAt(addr);
+                if (func == null) {
+                    return null;
+                }
+                name = func.getName();
+            } else {
+                // Create global var
+                int tx_id = program.startTransaction("Creating global variable");
+                try {
                     name = "DAT_" + addr;
                     Symbol symbol = program.getSymbolTable()
                             .createLabel(addr, name, SourceType.IMPORTED);
                     name = symbol.getName();
+                } catch (Exception e) {
+                    program.endTransaction(tx_id, false);
+                    throw e;
                 }
-            } else {
-                name = symbols[0].getName();
+                program.endTransaction(tx_id, true);
             }
-        stopUsingProgram();
+        } else {
+            name = symbols[0].getName();
+        }
         return name;
     }
 
@@ -180,7 +183,7 @@ class CRXLibrary {
         if (addr == null) return false;
 
         if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
-            return applyFunctionName(name, addr, program);
+            return applyFunctionNameHere(name, addr);
         } else {
             Symbol check = ThreeDSUtils.labelNamedData(name, addr, program);
             return check != null;
@@ -188,31 +191,44 @@ class CRXLibrary {
     }
 
     boolean applyNameHere(String name, SegmentOffset segOff) throws Exception {
-        startUsingProgram();
-            boolean retVal = applyNameHere(name, segOff, program);
-        stopUsingProgram();
-        return retVal;
+        return applyNameHere(name, segOff, program);
     }
 
-    boolean applyNameThere(String name, SegmentOffset segOff,
-                           CRXLibrary crxLibrary) throws Exception {
-        return crxLibrary.applyNameHere(name, segOff);
+    // Assumes program is open
+    void createFunctionHere(String name, Address addr, Program program) {
+        var cfc = new CreateFunctionCmd(name, addr, null, SourceType.IMPORTED);
+        int tx_id = program.startTransaction("Creating function");
+        try {
+            cfc.applyTo(program, monitor);
+        } catch (Exception e) {
+            program.endTransaction(tx_id, false);
+            throw e;
+        }
+        program.endTransaction(tx_id, true);
     }
 
-    boolean applyFunctionName(String name, Address addr,
-                              Program program) throws Exception {
+    // Assumes program is open
+    boolean applyFunctionNameHere(String name, Address addr) throws Exception {
         boolean thumb = (addr.getOffset() & 0x1) == 1;
         if (thumb) addr = addr.subtract(1);
         Function temp = program.getListing().getFunctionAt(addr);
         // If not a function entrypoint, can we make it one?
         if (temp == null) {
-            program.getListing().createFunction(
-                    name, addr, null, SourceType.IMPORTED);
+            createFunctionHere(name, addr, program);
             temp = program.getListing().getFunctionAt(addr);
         }
 
         if (temp != null) {
-            temp.setName(name, SourceType.IMPORTED);
+            if (temp.getName().equals(name)) return true;
+            int tx_id = program.startTransaction("Renaming Function");
+            try {
+                temp.setName(name, SourceType.IMPORTED);
+            } catch (DuplicateNameException e) {
+                Symbol[] ss = program.getSymbolTable().getSymbols(addr);
+                for (Symbol s : ss) program.getSymbolTable().removeSymbolSpecial(s);
+                temp.setName(name, SourceType.IMPORTED);
+            }
+            program.endTransaction(tx_id, true);
             return true;
         }
         // No function at address, and failed to create one
@@ -220,63 +236,59 @@ class CRXLibrary {
     }
 
     void applyExportedNames() throws Exception {
-        startUsingProgram();
-            int off = ThreeDSUtils.getInt(crxBytes, 0xD0);
-            int num = ThreeDSUtils.getInt(crxBytes, 0xD4);
-            for (int i=0; i<num; i++) {
-                String name = ThreeDSUtils.getName(crxBytes, off + (8L * i));
-                SegmentOffset segOff = new SegmentOffset(crxBytes, off + 4L + (8L * i));
-                applyNameHere(name, segOff, program);
-            }
-        stopUsingProgram();
+        int off = ThreeDSUtils.getInt(crxBytes, 0xD0);
+        int num = ThreeDSUtils.getInt(crxBytes, 0xD4);
+        if (num == 0) return;
+        for (int i=0; i<num; i++) {
+            String name = ThreeDSUtils.getName(crxBytes, getInt(crxBytes, off + (8L * i)));
+            SegmentOffset segOff = new SegmentOffset(crxBytes, off + 4L + (8L * i));
+            applyNameHere(name, segOff, program);
+        }
     }
 
     void modifyIndexedExports() throws Exception {
-        startUsingProgram();
-            int off = ThreeDSUtils.getInt(crxBytes, 0xD8);
-            int num = ThreeDSUtils.getInt(crxBytes, 0xDC);
-            for (int i=0; i<num; i++) {
-                SegmentOffset segOff = new SegmentOffset(crxBytes, off + (4L * i));
-                String name = getOrCreateNameHere(segOff);
-                if (!name.contains("public")) {
-                    applyNameHere("public_" + name, segOff, program);
-                }
+        int off = ThreeDSUtils.getInt(crxBytes, 0xD8);
+        int num = ThreeDSUtils.getInt(crxBytes, 0xDC);
+        for (int i=0; i<num; i++) {
+            SegmentOffset segOff = new SegmentOffset(crxBytes, off + (4L * i));
+            String name = getOrCreateNameHere(segOff);
+            if (!name.contains("public")) {
+                applyNameHere("public_" + name, segOff, program);
             }
-        stopUsingProgram();
+        }
     }
 
     void applyRelocs(Program here, CRXLibrary module,
                      List<RelocationEntry> relocs,
                      String symbol, Address exportFrom) throws Exception {
-        module.startUsingProgram();
-        Library moduleLibrary = module.libraries.computeIfAbsent(this, m -> {
-            try {
-                return m.program.getExternalManager()
-                        .addExternalLibraryName(m.name, SourceType.IMPORTED);
-            } catch (Exception e) {
-                return null;
+        Library moduleLibrary = libraries.get(module.name);
+        int tx_id = program.startTransaction("Creating Data Labels");
+        try {
+            for (RelocationEntry patch : relocs) {
+                Address importTo = patch.off.getAddr(segments);
+                ThreeDSUtils.labelNamedData(symbol, importTo, here);
+                RefType relocType = switch (patch.type) {
+                    case R_ARM_NONE -> null;
+                    case R_ARM_TARGET1, R_ARM_ABS32, R_ARM_REL32, R_ARM_PREL31 -> RefType.DATA;
+                    case R_ARM_THM_PC22, R_ARM_CALL -> RefType.UNCONDITIONAL_CALL;
+                    case R_ARM_JUMP24 -> RefType.CONDITIONAL_JUMP;
+                };
+                rman.addExternalReference(
+                        importTo,
+                        moduleLibrary,
+                        symbol,
+                        exportFrom,
+                        SourceType.IMPORTED,
+                        0,
+                        relocType
+                );
             }
-        });
-        for (RelocationEntry patch : relocs) {
-            Address importTo = patch.off.getAddr(module.segments);
-            ThreeDSUtils.labelNamedData(symbol, importTo, here);
-            RefType relocType = switch (patch.type) {
-                case R_ARM_NONE -> null;
-                case R_ARM_TARGET1, R_ARM_ABS32, R_ARM_REL32, R_ARM_PREL31 -> RefType.DATA;
-                case R_ARM_THM_PC22, R_ARM_CALL -> RefType.UNCONDITIONAL_CALL;
-                case R_ARM_JUMP24 -> RefType.CONDITIONAL_JUMP;
-            };
-            rman.addExternalReference(
-                    importTo,
-                    moduleLibrary,
-                    symbol,
-                    exportFrom,
-                    SourceType.IMPORTED,
-                    0,
-                    relocType
-            );
+        } catch (Exception e) {
+            program.endTransaction(tx_id, false);
+            throw new Exception(String.format("Either %s or %s were closed (likely %s)",
+                    this.name,module.name,module.name));
         }
-        module.stopUsingProgram();
+        program.endTransaction(tx_id, true);
     }
 
     void applyImports(List<CRXLibrary> crxLibraries) throws Exception {
@@ -295,29 +307,68 @@ class CRXLibrary {
                 ThreeDSUtils.getRelocs(crxBytes, relocsOff);
                 // TODO: Import indexed
             }
+            CRXLibrary module = crxLibraries.stream()
+                    .filter(l -> l.name.equalsIgnoreCase(crxName))
+                    .findFirst().orElse(null);
             for (int j=0; j<anonNum; j++) {
                 SegmentOffset symbolOffset = new SegmentOffset(crxBytes, anonOff + 0x8L * j);
                 int relocsOff = ThreeDSUtils.getInt(crxBytes, anonOff + 0x4 + (0x8L * j));
-                CRXLibrary module = crxLibraries.stream()
-                        .filter(l -> l.name.equalsIgnoreCase(crxName))
-                        .findFirst().orElse(null);
                 if (module == null) {
                     throw new NullPointerException(
                             String.format("Library %s was not found in the library list!\n", crxName));
                 }
                 List<RelocationEntry> relocs = getRelocs(crxBytes, relocsOff);
-                String symbolToImport = module.getOrCreateNameHere(symbolOffset);
                 Address symbolAddress = symbolOffset.getAddr(module.segments);
-                startUsingProgram();
-                    applyRelocs(program, module, relocs,
-                            String.format("%s_%s", module.name, symbolToImport),
-                            symbolAddress);
-                stopUsingProgram();
+                String symbolToImport = module.getOrCreateNameHere(symbolOffset);
+                if (symbolToImport == null) {
+                    symbolToImport = String.format("UNK_%s",symbolAddress);
+                }
+                applyRelocs(program, module, relocs,
+                        String.format("%s_%s", module.name, symbolToImport),
+                        symbolAddress);
             }
         }
     }
 
+    void applyExitLoadUnresolved() throws Exception {
+        SegmentOffset onLoad = new SegmentOffset(crxBytes, 0xA4);
+        applyNameHere("OnLoad", onLoad);
+        SegmentOffset onExit = new SegmentOffset(crxBytes, 0xA8);
+        applyNameHere("OnExit", onExit);
+        SegmentOffset onUnresolved = new SegmentOffset(crxBytes, 0xAC);
+        applyNameHere("OnUnresolved", onUnresolved);
+    }
+
+    void importModules(List<CRXLibrary> crxLibraries) throws Exception {
+        int tx_id = program.startTransaction("Importing Module");
+        try {
+            var exman = program.getExternalManager();
+            for (String libName : exman.getExternalLibraryNames()) {
+                exman.removeExternalLibrary(libName);
+            }
+            int off = getInt(crxBytes, 0xF0);
+            int num = getInt(crxBytes, 0xF4);
+            for (int i = 0; i < num; i++) {
+                long step_i = 0x14L * i;
+                String crxName = getName(crxBytes, getInt(crxBytes, off + step_i));
+                CRXLibrary module = crxLibraries.stream()
+                        .filter(l -> l.name.equalsIgnoreCase(crxName))
+                        .findFirst().orElse(null);
+                assert module != null;
+                Library moduleLibrary = exman.addExternalLibraryName(module.name, SourceType.IMPORTED);
+                libraries.put(module.name, moduleLibrary);
+                exman.setExternalPath(module.name, module.file.getPathname(), true);
+            }
+        } catch (Exception e) {
+            program.endTransaction(tx_id, false);
+            throw e;
+        }
+        program.endTransaction(tx_id, true);
+    }
+
     void link(List<CRXLibrary> crxLibraries) throws Exception {
+        applyExitLoadUnresolved();
+
         applyExportedNames();
         modifyIndexedExports();
         demangleAll();
