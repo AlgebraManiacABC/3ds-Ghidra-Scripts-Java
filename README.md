@@ -13,3 +13,10 @@ and additionally labels and demangles found symbols.
 Software Interrupts ([Services / SVC](https://www.3dbrew.org/wiki/SVC))
 * LabelServiceHandles (Coming Soon) - Labels handles to services
 ([Services API](https://www.3dbrew.org/wiki/Services_API))
+
+## Credit
+
+* [zaksabeast](https://github.com/zaksabeast) for your [Python scripts](https://github.com/zaksabeast/3ds-Ghidra-Scripts) as inspiration as the basis of LabelSVCFunctions/LabelServiceHandles
+* The [Reverse Engineering Discord](https://discord.gg/Pd4yAzV7ye) and the [Ghidra docs](https://ghidra.re/ghidra_docs/api/index.html) for Ghidra API help
+* [CRO0](https://www.3dbrew.org/wiki/CRO0) on 3dbrew
+* [wwylele](https://gist.github.com/wwylele)'s [CRO doc](https://gist.github.com/wwylele/325d53ee6a0f1dff6aa3473377335d93)
