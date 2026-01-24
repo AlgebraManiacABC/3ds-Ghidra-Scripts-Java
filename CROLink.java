@@ -121,12 +121,17 @@ class CRXLibrary {
         try {
             var options = new DemanglerOptions();
             options.setApplySignature(true);
-            for (Symbol symbol : program.getSymbolTable().getAllSymbols(true)) {
-                String name = symbol.getName();
-                Address addr = symbol.getAddress();
+            for (Symbol mangled : program.getSymbolTable().getAllSymbols(true)) {
+                String name = mangled.getName();
+                Address addr = mangled.getAddress();
                 List<DemangledObject> demangledObjects = DemanglerUtil.demangle(program, name, addr);
                 if (!demangledObjects.isEmpty()) {
-                    demangledObjects.getFirst().applyTo(program, addr, new DemanglerOptions(), monitor);
+                    var demangled = demangledObjects.getFirst();
+                    boolean applied = demangled.applyTo(
+                            program, addr, new DemanglerOptions(), monitor);
+                    if (applied) {
+                        program.getSymbolTable().removeSymbolSpecial(mangled);
+                    }
                 }
             }
         } catch (Exception e) {
