@@ -17,6 +17,7 @@ import ghidra.util.exception.DuplicateNameException;
 import ghidra.util.task.TaskMonitor;
 import util.*;
 
+import static java.lang.Thread.sleep;
 import static util.ThreeDSUtils.*;
 
 public class CROLink extends GhidraScript {
@@ -52,7 +53,13 @@ public class CROLink extends GhidraScript {
                                 "If not, progress in external libraries will be lost, and this script must be ran again.",
                         crxLibraries.size()));
         for (CRXLibrary crx : crxLibraries) {
-            if (shouldSave) pman.saveProgram(crx.program);
+            crx.program.clearUndo();
+            if (shouldSave && currentProgram != crx.program) {
+                while(crx.program.getCurrentTransactionInfo() != null) {
+                    sleep(1000);
+                }
+                crx.program.save("CROLink save", monitor);
+            }
             crx.cleanup();
         }
     }
