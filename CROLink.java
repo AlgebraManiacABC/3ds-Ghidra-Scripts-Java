@@ -46,13 +46,15 @@ public class CROLink extends GhidraScript {
         for (CRXLibrary crx : crxLibraries) {
             crx.link(crxLibraries);
         }
-        // Release hold of the programs
+        // Save or forget progress
+        boolean shouldSave = askYesNo("Save?",
+                String.format("%d modules linked successfully!\nDo you want to save? " +
+                                "If not, progress in external libraries will be lost, and this script must be ran again.",
+                        crxLibraries.size()));
         for (CRXLibrary crx : crxLibraries) {
+            if (shouldSave) pman.saveProgram(crx.program);
             crx.cleanup();
         }
-
-        // All modules have been linked!
-        printf("%d modules linked successfully!\n", crxLibraries.size());
     }
 }
 
