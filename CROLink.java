@@ -8,6 +8,7 @@ import ghidra.app.script.GhidraScript;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
 import ghidra.app.services.ProgramManager;
+import ghidra.app.util.NamespaceUtils;
 import ghidra.app.util.demangler.*;
 import ghidra.framework.model.*;
 import ghidra.program.model.address.*;
@@ -131,15 +132,28 @@ class CRXLibrary {
             var options = new DemanglerOptions();
             options.setApplySignature(true);
             for (Symbol mangled : program.getSymbolTable().getAllSymbols(true)) {
-                String name = mangled.getName();
                 Address addr = mangled.getAddress();
-                List<DemangledObject> demangledObjects = DemanglerUtil.demangle(program, name, addr);
-                if (!demangledObjects.isEmpty()) {
-                    var demangled = demangledObjects.getFirst();
-                    boolean applied = demangled.applyTo(
+                List<DemangledObject> objs = DemanglerUtil.demangle(program, mangled.getName(), addr);
+                for (var obj : objs) {
+                    boolean applied = obj.applyTo(
                             program, addr, new DemanglerOptions(), monitor);
                     if (applied) {
                         program.getSymbolTable().removeSymbolSpecial(mangled);
+                        Function func = program.getFunctionManager().getFunctionAt(addr);
+                        if (func != null) {
+                            func.setName(obj.getName(), SourceType.IMPORTED);
+                            if (obj.getNamespace() != null) {
+                                Namespace ns = NamespaceUtils.createNamespaceHierarchy(
+                                        obj.getNamespace().toString(),
+                                        null,  // global
+                                        program,
+                                        SourceType.IMPORTED
+                                );
+                                func.setParentNamespace(ns);
+                            }
+                        }
+
+                        break;
                     }
                 }
             }
@@ -389,8 +403,9 @@ class CRXLibrary {
 
         applyExportedNames();
         modifyIndexedExports();
-        demangleAll();
 
         applyImports(crxLibraries);
+
+        demangleAll();
     }
 }
