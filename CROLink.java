@@ -150,13 +150,20 @@ class CRXLibrary {
         if (symbols.length == 0) {
             // No symbol. Need to create one
             if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
-                // Create function, get name
-                createFunctionHere(null, addr, program);
                 Function func = program.getListing().getFunctionAt(addr);
-                if (func == null) {
-                    return null;
+                if (func != null) return func.getName();
+                // Disassemble first, if needed
+                boolean disassembled = program.getListing().getInstructionAt(addr) != null;
+                if (!disassembled) {
+                    disassemble(addr, (addr.getOffset() & 0x1) == 1);
                 }
-                name = func.getName();
+                // Create function, get name
+                createFunctionHere(null, addr);
+                func = program.getListing().getFunctionAt(addr);
+                if (func == null) {
+                    return String.format("INVALID_%s_%s",this.name,segOff);
+                }
+                return func.getName();
             } else {
                 // Create global var
                 int tx_id = program.startTransaction("Creating global variable");
@@ -195,16 +202,18 @@ class CRXLibrary {
     }
 
     // Assumes program is open
-    void createFunctionHere(String name, Address addr, Program program) {
+    boolean createFunctionHere(String name, Address addr) {
         var cfc = new CreateFunctionCmd(name, addr, null, SourceType.IMPORTED);
+        boolean retVal;
         int tx_id = program.startTransaction("Creating function");
         try {
-            cfc.applyTo(program, monitor);
+            retVal = cfc.applyTo(program, monitor);
         } catch (Exception e) {
             program.endTransaction(tx_id, false);
             throw e;
         }
         program.endTransaction(tx_id, true);
+        return retVal;
     }
 
     // Assumes program is open
@@ -214,7 +223,7 @@ class CRXLibrary {
         Function temp = program.getListing().getFunctionAt(addr);
         // If not a function entrypoint, can we make it one?
         if (temp == null) {
-            createFunctionHere(name, addr, program);
+            createFunctionHere(name, addr);
             temp = program.getListing().getFunctionAt(addr);
         }
 
