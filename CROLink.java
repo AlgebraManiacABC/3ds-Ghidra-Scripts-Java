@@ -25,7 +25,7 @@ public class CROLink extends GhidraScript {
 
     @Override
     protected void run() throws Exception {
-        // This script will link all cro's and the crs together.
+        // This script will link all .cro files and the static.crs file together.
 
         // Get pertinent files, and form .crx into proper CRXLibrary objects
         DomainFile codeFile = askDomainFile("Select the static module (code.bin / .code)");
@@ -34,7 +34,9 @@ public class CROLink extends GhidraScript {
         ProgramManager pman = getState().getTool().getService(ProgramManager.class);
         crxLibraries.add(new CRXLibrary(codeFile, crsFile, pman, monitor));
         for (DomainFile cro : croFolder.getFiles()) {
-            crxLibraries.add(new CRXLibrary(cro, pman, monitor));
+            if (cro.getName().contains(".cro")) {
+                crxLibraries.add(new CRXLibrary(cro, pman, monitor));
+            }
         }
 
         for (CRXLibrary crx : crxLibraries) {
@@ -56,11 +58,9 @@ public class CROLink extends GhidraScript {
 
 class CRXLibrary {
 
-    private boolean isStatic = false;
     SegmentBlock[] segments;
     byte[] crxBytes;
     String name;
-    private final ProgramManager pman;
     private final ReferenceManager rman;
     private final TaskMonitor monitor;
 
@@ -76,16 +76,10 @@ class CRXLibrary {
      */
     private final HashMap<String, Library> libraries = new HashMap<>();
 
-    int hash() {
-        return Objects.hash(name);
-    }
-
     CRXLibrary(DomainFile codeFile, File crsFile,
                ProgramManager pman, TaskMonitor monitor) throws Exception {
-        isStatic = true;
         file = codeFile;
         name = "|static|";
-        this.pman = pman;
         this.program = pman.openCachedProgram(codeFile, this);
         this.monitor = monitor;
         crxBytes = ThreeDSUtils.getAllBytes(crsFile);
@@ -97,7 +91,6 @@ class CRXLibrary {
                ProgramManager pman, TaskMonitor monitor) throws Exception {
         file = croFile;
         name = croFile.getName().split("\\.cro")[0];
-        this.pman = pman;
         this.program = pman.openCachedProgram(croFile, this);
         this.monitor = monitor;
         crxBytes = ThreeDSUtils.getAllBytes(program);
@@ -363,7 +356,9 @@ class CRXLibrary {
                 CRXLibrary module = crxLibraries.stream()
                         .filter(l -> l.name.equalsIgnoreCase(crxName))
                         .findFirst().orElse(null);
-                assert module != null;
+                if (module == null) {
+                    throw new Exception(String.format("Library %s did not exist in the provided directory!", crxName));
+                }
                 Library moduleLibrary = exman.addExternalLibraryName(module.name, SourceType.IMPORTED);
                 libraries.put(module.name, moduleLibrary);
                 exman.setExternalPath(module.name, module.file.getPathname(), true);
