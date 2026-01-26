@@ -4,6 +4,7 @@
 import java.io.*;
 import java.util.*;
 
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
@@ -14,7 +15,9 @@ import ghidra.framework.model.*;
 import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
+import ghidra.util.Msg;
 import ghidra.util.exception.DuplicateNameException;
+import ghidra.util.exception.TimeoutException;
 import ghidra.util.task.TaskMonitor;
 import util.*;
 
@@ -36,7 +39,8 @@ public class CROLink extends GhidraScript {
         ProgramManager pman = getState().getTool().getService(ProgramManager.class);
         crxLibraries.add(new CRXLibrary(codeFile, crsFile, pman, monitor));
         for (DomainFile cro : croFolder.getFiles()) {
-            if (cro.getName().contains(".cro")) {
+            CRXLibrary temp = new CRXLibrary(cro, pman, monitor);
+            if (temp.isValidCRO0()) {
                 crxLibraries.add(new CRXLibrary(cro, pman, monitor));
             }
         }
@@ -54,14 +58,12 @@ public class CROLink extends GhidraScript {
                                 "If not, progress in external libraries will be lost, and this script must be ran again.",
                         crxLibraries.size()));
         for (CRXLibrary crx : crxLibraries) {
-            crx.program.clearUndo();
-            if (shouldSave && currentProgram != crx.program) {
-                while(crx.program.getCurrentTransactionInfo() != null) {
-                    sleep(1000);
-                }
-                crx.program.save("CROLink save", monitor);
+            if (crx.program == currentProgram) continue;
+            try {
+                crx.cleanup(shouldSave);
+            } catch (TimeoutException e) {
+                closeProgram(crx.program);
             }
-            crx.cleanup();
         }
     }
 }
@@ -86,29 +88,71 @@ class CRXLibrary {
      */
     private final HashMap<String, Library> libraries = new HashMap<>();
 
+    boolean isValidCRO0() {
+        if (crxBytes == null) return false;
+        // "CRO0" as LE int
+        return 0x304F5243 == getInt(crxBytes, 0x80);
+    }
+
     CRXLibrary(DomainFile codeFile, File crsFile,
                ProgramManager pman, TaskMonitor monitor) throws Exception {
-        file = codeFile;
-        name = "|static|";
-        this.program = pman.openCachedProgram(codeFile, this);
-        this.monitor = monitor;
         crxBytes = ThreeDSUtils.getAllBytes(crsFile);
-        segments = ThreeDSUtils.readSegments(crxBytes, program);
-        rman = program.getReferenceManager();
+        if (!isValidCRO0()) {
+            file = null;
+            name = null;
+            program = null;
+            this.monitor = null;
+            segments = null;
+            rman = null;
+        } else {
+            file = codeFile;
+            name = "|static|";
+            program = pman.openCachedProgram(codeFile, this);
+            this.monitor = monitor;
+            segments = ThreeDSUtils.readSegments(crxBytes, program);
+            rman = program.getReferenceManager();
+        }
     }
 
     CRXLibrary(DomainFile croFile,
                ProgramManager pman, TaskMonitor monitor) throws Exception {
-        file = croFile;
-        name = croFile.getName().split("\\.cro")[0];
-        this.program = pman.openCachedProgram(croFile, this);
-        this.monitor = monitor;
+        program = pman.openCachedProgram(croFile, this);
         crxBytes = ThreeDSUtils.getAllBytes(program);
-        segments = ThreeDSUtils.readSegments(crxBytes, program);
-        rman = program.getReferenceManager();
+        if (!isValidCRO0()) {
+            file = null;
+            name = null;
+            program.release(this);
+            program = null;
+            this.monitor = null;
+            segments = null;
+            rman = null;
+        } else {
+            file = croFile;
+            name = croFile.getName().split("\\.cro")[0];
+            this.monitor = monitor;
+            segments = ThreeDSUtils.readSegments(crxBytes, program);
+            rman = program.getReferenceManager();
+        }
     }
 
-    void cleanup() {
+    void cleanup(boolean save) throws Exception {
+        AutoAnalysisManager.getAnalysisManager(program).cancelQueuedTasks();
+        AutoAnalysisManager.getAnalysisManager(program).dispose();
+        int i;
+        for(i=0; program.getCurrentTransactionInfo() != null && i < 60; i++) {
+            Thread.sleep(1000);
+        }
+        if (i == 60) {
+            TransactionInfo info = program.getCurrentTransactionInfo();
+            String error = String.format(
+                    "Program %s hung on transaction: %s (%s) [%d] - forcibly closing",
+                    program,info.getDescription(), info.getStatus(), info.getID());
+            Msg.error(this,error);
+            throw new TimeoutException(error);
+        }
+        program.clearUndo();
+        if (save)
+            program.save("CROLink save", monitor);
         program.release(this);
     }
 
@@ -135,8 +179,15 @@ class CRXLibrary {
                 Address addr = mangled.getAddress();
                 List<DemangledObject> objs = DemanglerUtil.demangle(program, mangled.getName(), addr);
                 for (var obj : objs) {
-                    boolean applied = obj.applyTo(
-                            program, addr, new DemanglerOptions(), monitor);
+                    boolean applied = false;
+                    try {
+                        applied = obj.applyTo(
+                                program, addr, new DemanglerOptions(), monitor);
+                    } catch (IllegalArgumentException e) {
+                        Msg.error(this,String.format("Couldn't apply obj '%s' to addr %s",
+                                addr, obj));
+                        continue;
+                    }
                     if (applied) {
                         program.getSymbolTable().removeSymbolSpecial(mangled);
                         Function func = program.getFunctionManager().getFunctionAt(addr);
@@ -213,7 +264,15 @@ class CRXLibrary {
         if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
             return applyFunctionNameHere(name, addr);
         } else {
-            Symbol check = ThreeDSUtils.labelNamedData(name, addr, program);
+            Symbol check = null;
+            int tx_id = program.startTransaction("Naming address");
+            try {
+                check = ThreeDSUtils.labelNamedData(name, addr, program);
+            } catch (Exception e) {
+                program.endTransaction(tx_id, false);
+                throw e;
+            }
+            program.endTransaction(tx_id, true);
             return check != null;
         }
     }
@@ -296,7 +355,8 @@ class CRXLibrary {
         try {
             for (RelocationEntry patch : relocs) {
                 Address importTo = patch.off.getAddr(segments);
-                ThreeDSUtils.labelNamedData(symbol, importTo, here);
+                applyNameHere(symbol, toSegmentOffset(importTo,segments), here);
+//                ThreeDSUtils.labelNamedData(symbol, importTo, here);
                 RefType relocType = switch (patch.type) {
                     case R_ARM_NONE -> null;
                     case R_ARM_TARGET1, R_ARM_ABS32, R_ARM_REL32, R_ARM_PREL31 -> RefType.DATA;

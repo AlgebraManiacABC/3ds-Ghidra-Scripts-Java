@@ -47,6 +47,7 @@ public class ThreeDSUtils {
 
     // The program must be open
     public static byte[] getAllBytes(Program program) throws MemoryAccessException {
+        if (program == null) return null;
         Memory memory = program.getMemory();
         int blockCount = memory.getAllFileBytes().size();
         MemoryBlock[] blocks = Arrays.stream(memory.getBlocks())
@@ -89,6 +90,18 @@ public class ThreeDSUtils {
 //            printf("New segment found: %s\n", segments[i]);
         }
         return segments;
+    }
+
+    public static SegmentOffset toSegmentOffset(Address addr, SegmentBlock[] segments) {
+        SegmentOffset segOff = null;
+        for (int i = 0; i < segments.length; i++) {
+            if (addr.compareTo(segments[i].getEnd()) > 0) continue;
+            if (addr.compareTo(segments[i].getStart()) < 0) break;
+            int id = segments[i].id;
+            long val = (addr.getOffset() << 4) & id;
+            segOff = new SegmentOffset(val);
+        }
+        return segOff;
     }
 
     public static List<RelocationEntry> getRelocs(byte[] arr, long off) {
