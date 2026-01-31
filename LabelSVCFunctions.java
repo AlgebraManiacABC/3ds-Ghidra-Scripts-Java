@@ -74,7 +74,8 @@ public class LabelSVCFunctions extends GhidraScript {
             printf("SVC found at 0x%s: %s (%s)\n",addr.toString(),svc_instruction.toString(),name);
             switch (name) {
                 case "GetSystemTick", "ClearEvent", "CloseHandle", "SignalEvent", "ExitProcess",
-                        "SendSyncRequest", "WaitSynchronization1" -> {}
+                        "SendSyncRequest", "WaitSynchronization1", "WaitSynchronizationN",
+                        "SetThreadPriority", "ReleaseMutex" -> {}
                 default -> {
                     Function svc_func = getFunctionContaining(addr);
                     if (svc_func != null) {
