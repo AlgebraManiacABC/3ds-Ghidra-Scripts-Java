@@ -35,6 +35,13 @@ public class SplitToELF extends GhidraScript {
                     List<Integer> relIndices = new ArrayList<>();
                     int strtab_idx = 0;
                     var eh = new ELFHeader(in);
+                    if (eh.indent[0] != 0x7f || eh.indent[1] != 'E' ||
+                            eh.indent[2] != 'L' || eh.indent[3] != 'F') throw new Exception(
+                                    String.format(
+                                            "%s is not a valid ELF file!",
+                                            path.getFileName()
+                                    )
+                    );
                     List<SectionHeaderEntry> sectionHeaders = new ArrayList<>();
                     for (short i=0; i<eh.shnum; i++) {
                         // Seek to section header
