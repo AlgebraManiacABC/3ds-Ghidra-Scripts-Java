@@ -3,6 +3,7 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.Symbol;
 import util.ThreeDSUtils;
 
 import java.io.*;
@@ -118,15 +119,18 @@ public class SplitToELF extends GhidraScript {
                         String relsh_name = ThreeDSUtils.getName(shstrings, relsh.name_off);
                         if (relsh_name.equals(".rel.text")) {
                             in.seek(relsh.off);
-                            var re = new RelocationEntry(in);
-                            var sym = symtabEntries.get(re.sym_idx);
-                            // strings technically shouldn't be null at this point;
-                            //  that is, not if relocations exist!
-                            String re_name = ThreeDSUtils.getName(
-                                    Objects.requireNonNull(strings), sym.name_off);
-                            undefined.add(re_name);
-                            setMask(re, mask);
-                            break;
+                            int num_relocs = relsh.size / relsh.entsize;
+                            for (int j=0; j<num_relocs; j++) {
+                                var re = new RelocationEntry(in);
+                                var sym = symtabEntries.get(re.sym_idx);
+                                // strings technically shouldn't be null at this point;
+                                //  that is, not if relocations exist!
+                                String re_name = ThreeDSUtils.getName(
+                                        Objects.requireNonNull(strings), sym.name_off);
+                                printf("Name to add: %s\n",re_name);
+                                undefined.add(re_name);
+                                setMask(re, mask);
+                            }
                         }
                     }
                 }
@@ -191,7 +195,14 @@ public class SplitToELF extends GhidraScript {
                 counter++;
             }
             try (RandomAccessFile out = new RandomAccessFile(ofile, "rw")) {
-                createObjectFile(p.start, p.end, out);
+                createObjectFile(p.start, p.end, out, undefined);
+            }
+        }
+        if (!undefined.isEmpty()) {
+            // Not all symbols added!
+            printf("Not all symbols added! Remaining:\n");
+            for (String undef : undefined) {
+                printf("\t%s\n",undef);
             }
         }
     }
@@ -225,35 +236,140 @@ public class SplitToELF extends GhidraScript {
         return sb.toString();
     }
 
-    // 'end' will be considered within object
     void createObjectFile(Address start, Address end, RandomAccessFile out) throws Exception {
         // Header
         new ELFHeader().write(out);
-        // Text
+        // .text
         long text_off = out.getFilePointer();
         out.write(getBytes(start, (int) end.subtract(start) + 1));
-        // shstrtab
+        // .shstrtab
         long shstrtab_off = out.getFilePointer();
         long text_size = shstrtab_off - text_off;
-        out.write(new byte[]{0});
+        out.write(new byte[]{0}); // null section
         out.write(".text\0".getBytes(StandardCharsets.UTF_8));
+        out.write(".symtab\0".getBytes(StandardCharsets.UTF_8));
+        out.write(".strtab\0".getBytes(StandardCharsets.UTF_8)); // empty string only, unless adding relocs
         out.write(".shstrtab\0".getBytes(StandardCharsets.UTF_8));
         // Section Entries
         long sh_off = out.getFilePointer();
         long shstrtab_size = sh_off - shstrtab_off;
-        SectionHeaderEntry sh_null = new SectionHeaderEntry(0,0,0,0,0,0);
-        sh_null.write(out);
-        SectionHeaderEntry sh_text = new SectionHeaderEntry(1,1,0x6, (int) start.getOffset(),(int)text_off,(int)text_size);
-        sh_text.write(out);
-        SectionHeaderEntry sh_strs = new SectionHeaderEntry(3,3,0,0,(int)shstrtab_off,(int)shstrtab_size);
-        sh_strs.write(out);
+        // Null section
+        new SectionHeaderEntry(0,0,0,0,0,0,0,0,0)
+                .write(out);
+        // .text
+        new SectionHeaderEntry(1,1,0x6, (int) start.getOffset(),(int)text_off,(int)text_size, 0, 0, 0)
+                .write(out);
+        // .shstrtab
+        new SectionHeaderEntry(4,3,0,0,(int)shstrtab_off,(int)shstrtab_size, 0, 0, 0)
+                .write(out);
 
         // Fix header:
         out.seek(0x20);
         writeIntLE(out,(int)sh_off); // shoff
         out.seek(0x30);
-        out.write(new byte[]{3, 0}); // shnum (three sections)
-        out.write(new byte[]{2, 0}); // shstrndx (shstrtab is section 2)
+        writeShortLE(out, (short) 3); // shnum (num sections)
+        writeShortLE(out, (short) 2); // shstrndx (shstrtab is section __)
+    }
+
+    // 'end' will be considered within object
+    void createObjectFile(Address start, Address end, RandomAccessFile out, List<String> undefined) throws Exception {
+        if (undefined.isEmpty()) {
+            createObjectFile(start,end,out);
+            return;
+        }
+        // First, get list of undefined symbols in this section of the program
+        List<Symbol> toDefine = new ArrayList<>();
+        for (String undef : new ArrayList<>(undefined)) {
+            List<Symbol> symbols = getSymbols(undef, currentProgram.getGlobalNamespace());
+            symbols.removeIf(symbol -> symbol.getAddress().compareTo(start) < 0 ||
+                    symbol.getAddress().compareTo(end) > 0);
+            if (symbols.isEmpty()) continue;
+            if (symbols.size() > 1) {
+                String err = String.format(
+                        "More than one symbol for %s in segment %s to %s",
+                        undef, start, end);
+                printf("%s\n",err);
+                throw new Exception(err);
+            }
+            // Now, only one symbol in range
+            Symbol found = symbols.getFirst();
+            printf("Found symbol %s at %s\n",found.getName(),found.getAddress());
+            toDefine.add(found);
+            undefined.remove(undef);
+        }
+        if (toDefine.isEmpty()) {
+            // No exports needed
+            createObjectFile(start, end, out);
+            return;
+        }
+        var baos = new ByteArrayOutputStream();
+        baos.write('\0');
+        for (Symbol symbol : toDefine) {
+            baos.writeBytes(symbol.getName().getBytes(StandardCharsets.UTF_8));
+            baos.write('\0');
+        }
+        byte[] strtab_bytes = baos.toByteArray();
+
+        // Header
+        new ELFHeader().write(out);
+        // .text
+        long text_off = out.getFilePointer();
+        out.write(getBytes(start, (int) end.subtract(start) + 1));
+        // .symtab
+        long symtab_off = out.getFilePointer();
+        long text_size = symtab_off - text_off;
+        out.write(new byte[0x10]);
+        for (Symbol def : toDefine) {
+            int name_off = toDefine.stream().limit(toDefine.indexOf(def))
+                    .mapToInt(s -> s.getName().length() + 1).sum();
+            // NOTE: st_other is 0x2 for now ("hidden") because decomp.me creates hidden exports without any flags, so there.
+            var sym = new SymbolTableEntry(name_off + 1, (int) def.getAddress().subtract(start),
+                    def.getName().length() + 1, (byte) 0x12, (byte) 2, (short) 1);
+            sym.write(out);
+        }
+        // .strtab
+        long strtab_off = out.getFilePointer();
+        long symtab_size = strtab_off - symtab_off;
+        out.write(strtab_bytes);
+        // .shstrtab
+        long shstrtab_off = out.getFilePointer();
+        long strtab_size = shstrtab_off - strtab_off;
+        baos = new ByteArrayOutputStream();
+        baos.write(new byte[]{0}); // null section
+        int text_name = baos.size();
+        baos.write(".text\0".getBytes(StandardCharsets.UTF_8));
+        int symtab_name = baos.size();
+        baos.write(".symtab\0".getBytes(StandardCharsets.UTF_8));
+        int strtab_name = baos.size();
+        baos.write(".strtab\0".getBytes(StandardCharsets.UTF_8)); // empty string only, unless adding relocs
+        int shstrtab_name = baos.size();
+        baos.write(".shstrtab\0".getBytes(StandardCharsets.UTF_8));
+        out.write(baos.toByteArray());
+        // Section Entries
+        long sh_off = out.getFilePointer();
+        long shstrtab_size = sh_off - shstrtab_off;
+        // Null section
+        new SectionHeaderEntry(0,0,0,0,0,0,0,0,0)
+                .write(out);
+        // .text
+        new SectionHeaderEntry(text_name,1,0x6, (int) start.getOffset(),(int)text_off,(int)text_size, 0, 0, 0)
+                .write(out);
+        // .symtab
+        new SectionHeaderEntry(symtab_name, 2, 0, 0, (int)symtab_off, (int) symtab_size, 3, 1, 0x10)
+                .write(out);
+        // .strtab
+        new SectionHeaderEntry(strtab_name, 3, 0, 0, (int)strtab_off, (int)strtab_size, 0, 0, 0)
+                .write(out);
+        // .shstrtab
+        new SectionHeaderEntry(shstrtab_name,3,0,0,(int)shstrtab_off,(int)shstrtab_size, 0, 0, 0)
+                .write(out);
+
+        // Fix header:
+        out.seek(0x20);
+        writeIntLE(out,(int)sh_off); // shoff
+        out.seek(0x30);
+        writeShortLE(out, (short) 5); // shnum (num sections)
+        writeShortLE(out, (short) 4); // shstrndx (shstrtab is section __)
     }
 
     void writeIntLE(RandomAccessFile out, int val) throws IOException {
@@ -333,13 +449,16 @@ public class SplitToELF extends GhidraScript {
             entsize = readIntLE(in);
         }
 
-        SectionHeaderEntry(int name_off, int type, int flags, int addr, int off, int size) {
+        SectionHeaderEntry(int name_off, int type, int flags, int addr, int off, int size, int link, int info, int entsize) {
             this.name_off = name_off;
             this.type = type;
             this.flags = flags;
             this.addr = addr;
             this.off = off;
             this.size = size;
+            this.link = link;
+            this.info = info;
+            this.entsize = entsize;
         }
 
         void write(RandomAccessFile out) throws IOException {
@@ -375,7 +494,7 @@ public class SplitToELF extends GhidraScript {
         int size;
         byte info;
         byte other;
-        int shndx;
+        short shndx;
 
         SymbolTableEntry(RandomAccessFile in) throws IOException {
             name_off = readIntLE(in);
@@ -383,10 +502,10 @@ public class SplitToELF extends GhidraScript {
             size = readIntLE(in);
             info = in.readByte();
             other = in.readByte();
-            shndx = readIntLE(in);
+            shndx = readShortLE(in);
         }
 
-        SymbolTableEntry(int name_off, int value, int size, byte info, byte other, int shndx) {
+        SymbolTableEntry(int name_off, int value, int size, byte info, byte other, short shndx) {
             this.name_off = name_off;
             this.value = value;
             this.size = size;
@@ -395,13 +514,18 @@ public class SplitToELF extends GhidraScript {
             this.shndx = shndx;
         }
 
+        public String toString() {
+            return String.format("name offset %08x (%d bytes) [%s] -> section header #%d",
+                    name_off, size, "wip", shndx);
+        }
+
         void write(RandomAccessFile out) throws IOException {
             writeIntLE(out, name_off);
             writeIntLE(out, value);
             writeIntLE(out, size);
-            writeIntLE(out, info);
-            writeIntLE(out, other);
-            writeIntLE(out, shndx);
+            out.write(info);
+            out.write(other);
+            writeShortLE(out, shndx);
         }
     }
 
@@ -444,7 +568,9 @@ public class SplitToELF extends GhidraScript {
                 mask[re.off + 1] = 0x00;
                 mask[re.off + 2] = 0x00;
             }
-            default -> {}
+            default -> {
+                printf("Didn't set a mask for %s\n",re.type);
+            }
         }
     }
 
@@ -459,6 +585,11 @@ public class SplitToELF extends GhidraScript {
             int tmp = readIntLE(in);
             sym_idx = tmp >> 8;
             type = RelocationType.typeOf((byte) (tmp & 0xff));
+        }
+
+        public String toString() {
+            return String.format("offset %08x | symbol #%d | type %s",
+                    off, sym_idx, type);
         }
 
         RelocationEntry(int off, int sym_idx, RelocationType type) {
