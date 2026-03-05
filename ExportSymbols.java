@@ -22,15 +22,21 @@ public class ExportSymbols extends GhidraScript {
         PrintWriter out = new PrintWriter(new FileWriter(outFile));
         out.println("Location,Name,Mode,Size");
 
+        boolean unique = askYesNo("Create unique symbols?","Should the script export each symbol with a unique name (including the symbol address)?");
+
+        FunctionManager fm = currentProgram.getFunctionManager();
         Iterator<Symbol> iter = currentProgram.getSymbolTable().getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol symbol = iter.next();
             if (!symbol.isPrimary() || symbol.isExternal()) continue;
             Address addr = symbol.getAddress();
-            String name = symbol.getName();
+            String name = symbol.getName(true);
             String mode = null;
             CodeUnit cu = currentProgram.getListing().getCodeUnitAt(addr);
             if (cu instanceof Instruction) {
+                Function f = fm.getFunctionAt(addr);
+                if (f == null) continue;
+                if (f.isThunk()) name += "_" + addr;
                 var rv = currentProgram.getProgramContext().getRegisterValue(tmode, addr);
                 if (rv != null) {
                     BigInteger val = rv.getUnsignedValue();
@@ -40,6 +46,9 @@ public class ExportSymbols extends GhidraScript {
                 mode = "$d";
             }
             if (mode == null) continue;
+            if (unique && !name.contains(addr.toString())) {
+                name += "_" + addr;
+            }
             Function func = currentProgram.getFunctionManager().getFunctionAt(addr);
             long size = func != null ? func.getBody().getNumAddresses() : 0;
             out.println(String.format("\"%s\",\"%s\",%s,%08x",addr,name,mode,size));
