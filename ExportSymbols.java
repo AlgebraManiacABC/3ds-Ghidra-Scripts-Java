@@ -1,6 +1,11 @@
 //@category 3DS
 import ghidra.app.script.GhidraScript;
+import ghidra.app.services.ProgramManager;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressRange;
+import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.Reference;
@@ -12,6 +17,7 @@ import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.math.BigInteger;
 import java.util.*;
+import java.util.stream.StreamSupport;
 
 public class ExportSymbols extends GhidraScript {
 
@@ -36,19 +42,40 @@ public class ExportSymbols extends GhidraScript {
 
     @Override
     protected void run() throws Exception {
-        Register tmode = currentProgram.getProgramContext().getRegister("TMode");
 
-        File outFile = askFile("Output file", "OK");
-        PrintWriter out = new PrintWriter(new FileWriter(outFile));
-        out.println("Location,Name,Mode,Size");
-
+        DomainFolder folder = askProjectFolder("Select Directory to Symbolify");
+        File outDir = askDirectory("Output directory", "OK");
         boolean unique = askYesNo("Create unique symbols?","Should the script export each symbol with a unique name (including the symbol address)?");
+
+        List<DomainFile> files_to_symbolify = getAllFilesInDirectory(folder);
+        ProgramManager pman = getState().getTool().getService(ProgramManager.class);
+
+        for (DomainFile file : files_to_symbolify) {
+            File outFile = new File(outDir, file.getName() + ".csv");
+            PrintWriter out = new PrintWriter(new FileWriter(outFile));
+            Program p = pman.openCachedProgram(file, this);
+
+            out.println("Location,Name,Mode,Size");
+            List<SymbolData> symbols = extractSymbols(p, unique);
+            for (SymbolData symbol : symbols) {
+                out.println(symbol);
+            }
+
+            if (p != currentProgram) pman.closeProgram(p, true);
+            out.close();
+        }
+
+        println("Done!");
+    }
+
+    List<SymbolData> extractSymbols(Program program, boolean unique) {
 
         Map<String, List<SymbolData>> symbolCounts = new HashMap<>();
 
-        FunctionManager fm = currentProgram.getFunctionManager();
-        ReferenceManager rm = currentProgram.getReferenceManager();
-        Iterator<Symbol> iter = currentProgram.getSymbolTable().getAllSymbols(false);
+        Register tmode = program.getProgramContext().getRegister("TMode");
+        FunctionManager fm = program.getFunctionManager();
+        ReferenceManager rm = program.getReferenceManager();
+        Iterator<Symbol> iter = program.getSymbolTable().getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol symbol = iter.next();
             if (!symbol.isPrimary() || symbol.isExternal()) continue;
@@ -58,42 +85,71 @@ public class ExportSymbols extends GhidraScript {
             if (hasExternalRef) continue;
             String name = symbol.getName(true);
             String mode = null;
-            CodeUnit cu = currentProgram.getListing().getCodeUnitAt(addr);
+            CodeUnit cu = program.getListing().getCodeUnitAt(addr);
             Function f = fm.getFunctionAt(addr);
             long size = 0;
             if (cu instanceof Instruction) {
                 if (f == null) continue;
-                size = f.getBody().getNumAddresses();
                 if (f.isThunk()) name += "_" + addr;
-                var rv = currentProgram.getProgramContext().getRegisterValue(tmode, addr);
+                var rv = program.getProgramContext().getRegisterValue(tmode, addr);
                 if (rv != null) {
                     BigInteger val = rv.getUnsignedValue();
                     mode = Objects.equals(val, BigInteger.ONE) ? "$t" : "$a";
                 }
+                // Bad news; numAddresses is unreliable if there are multiple ranges.
+                if (f.getBody().getNumAddressRanges() == 1) {
+                    size = f.getBody().getNumAddresses();
+                } else {
+                    // This is an okay alternative, though imperfect
+                    AddressRangeIterator rangeIter = f.getBody().getAddressRanges();
+                    List<AddressRange> ranges = StreamSupport
+                            .stream(Spliterators
+                            .spliteratorUnknownSize(rangeIter, 0), false)
+                            .sorted()
+                            .toList();
+                    for (AddressRange range : ranges) {
+                        // Generate multiple symbols
+                        Address ranged_addr = range.getMinAddress();
+                        long ranged_size = range.getLength();
+                        String ranged_name = name + "_" + ranged_addr;
+                        symbolCounts.computeIfAbsent(ranged_name, k -> new ArrayList<>())
+                                .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size));
+                    }
+                    continue;
+                }
             } else if (cu instanceof Data) {
-                var d = currentProgram.getListing().getDataAt(addr);
+                var d = program.getListing().getDataAt(addr);
                 if (d == null) continue;
                 size = d.getDataType().getLength();
                 mode = "$d";
             }
             if (mode == null || size <= 0) continue;
-            symbolCounts.computeIfAbsent(name, k -> new ArrayList<>()).add(new SymbolData(addr, name, mode, size));
+            symbolCounts.computeIfAbsent(name, k -> new ArrayList<>())
+                    .add(new SymbolData(addr, name, mode, size));
         }
 
+        List<SymbolData> symbols = new ArrayList<>();
         if (unique) {
             for (List<SymbolData> sdList : symbolCounts.values()) {
                 if (sdList.size() > 1) {
                     for (SymbolData sd : sdList) {
                         sd.name += String.format("_%s", sd.addr);
-                        out.println(sd);
+                        symbols.add(sd);
                     }
                 } else {
-                    out.println(sdList.getFirst());
+                    symbols.add(sdList.getFirst());
                 }
             }
         }
+        return symbols;
+    }
 
-        out.close();
-        println("Done!");
+    List<DomainFile> getAllFilesInDirectory(DomainFolder root) {
+        List<DomainFile> files = new ArrayList<>();
+        for (DomainFolder subfolder : root.getFolders()) {
+            files.addAll(List.of(subfolder.getFiles()));
+        }
+        files.addAll(List.of(root.getFiles()));
+        return files;
     }
 }
