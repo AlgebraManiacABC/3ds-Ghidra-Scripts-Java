@@ -43,25 +43,39 @@ public class ExportSymbols extends GhidraScript {
     @Override
     protected void run() throws Exception {
 
-        DomainFolder folder = askProjectFolder("Select Directory to Symbolify");
-        File outDir = askDirectory("Output directory", "OK");
+        boolean directory = askYesNo("Export in directory?","Should symbols from an entire directory be exported? (Otherwise, will operate on this program)");
         boolean unique = askYesNo("Create unique symbols?","Should the script export each symbol with a unique name (including the symbol address)?");
 
-        List<DomainFile> files_to_symbolify = getAllFilesInDirectory(folder);
-        ProgramManager pman = getState().getTool().getService(ProgramManager.class);
+        if (directory) {
+            DomainFolder folder = askProjectFolder("Select Directory to Symbolify");
+            File outDir = askDirectory("Output directory", "OK");
 
-        for (DomainFile file : files_to_symbolify) {
-            File outFile = new File(outDir, file.getName() + ".csv");
+            List<DomainFile> files_to_symbolify = getAllFilesInDirectory(folder);
+            ProgramManager pman = getState().getTool().getService(ProgramManager.class);
+
+            for (DomainFile file : files_to_symbolify) {
+                File outFile = new File(outDir, file.getName() + ".csv");
+                PrintWriter out = new PrintWriter(new FileWriter(outFile));
+                Program p = pman.openCachedProgram(file, this);
+
+                out.println("Location,Name,Mode,Size");
+                List<SymbolData> symbols = extractSymbols(p, unique);
+                for (SymbolData symbol : symbols) {
+                    out.println(symbol);
+                }
+
+                if (p != currentProgram) pman.closeProgram(p, true);
+                out.close();
+            }
+
+        } else {
+            File outFile = askFile("Output file", "OK");
             PrintWriter out = new PrintWriter(new FileWriter(outFile));
-            Program p = pman.openCachedProgram(file, this);
-
             out.println("Location,Name,Mode,Size");
-            List<SymbolData> symbols = extractSymbols(p, unique);
+            List<SymbolData> symbols = extractSymbols(currentProgram, unique);
             for (SymbolData symbol : symbols) {
                 out.println(symbol);
             }
-
-            if (p != currentProgram) pman.closeProgram(p, true);
             out.close();
         }
 
