@@ -125,7 +125,10 @@ public class ExportSymbols extends GhidraScript {
                         // Generate multiple symbols
                         Address ranged_addr = range.getMinAddress();
                         long ranged_size = range.getLength();
-                        String ranged_name = name + "_" + ranged_addr;
+                        String ranged_name = name;
+                        if (ranged_addr != addr) {
+                            ranged_name += "_" + ranged_addr;
+                        }
                         symbolCounts.computeIfAbsent(ranged_name, k -> new ArrayList<>())
                                 .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size));
                     }
