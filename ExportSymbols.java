@@ -8,6 +8,7 @@ import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.program.model.symbol.Symbol;
@@ -26,17 +27,19 @@ public class ExportSymbols extends GhidraScript {
         String name;
         String mode;
         long size;
+        String segment;
 
-        SymbolData(Address addr, String name, String mode, long size) {
+        SymbolData(Address addr, String name, String mode, long size, String segment) {
             this.addr = addr;
             this.name = name;
             this.mode = mode;
             this.size = size;
+            this.segment = segment;
         }
 
         @Override
         public String toString() {
-            return String.format("\"%s\",\"%s\",%s,%08x",addr,name,mode,size);
+            return String.format("\"%s\",\"%s\",%s,%08x,\"%s\"",addr,name,mode,size,segment);
         }
     }
 
@@ -58,7 +61,7 @@ public class ExportSymbols extends GhidraScript {
                 PrintWriter out = new PrintWriter(new FileWriter(outFile));
                 Program p = pman.openCachedProgram(file, this);
 
-                out.println("Location,Name,Mode,Size");
+                out.println("Location,Name,Mode,Size,Segment");
                 List<SymbolData> symbols = extractSymbols(p, unique);
                 for (SymbolData symbol : symbols) {
                     out.println(symbol);
@@ -71,7 +74,7 @@ public class ExportSymbols extends GhidraScript {
         } else {
             File outFile = askFile("Output file", "OK");
             PrintWriter out = new PrintWriter(new FileWriter(outFile));
-            out.println("Location,Name,Mode,Size");
+            out.println("Location,Name,Mode,Size,Segment");
             List<SymbolData> symbols = extractSymbols(currentProgram, unique);
             for (SymbolData symbol : symbols) {
                 out.println(symbol);
@@ -129,8 +132,9 @@ public class ExportSymbols extends GhidraScript {
                         if (!ranged_addr.equals(addr)) {
                             ranged_name += "_" + ranged_addr;
                         }
+                        MemoryBlock segment = getMemoryBlock(ranged_addr);
                         symbolCounts.computeIfAbsent(ranged_name, k -> new ArrayList<>())
-                                .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size));
+                                .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size, segment.getName()));
                     }
                     continue;
                 }
@@ -141,8 +145,9 @@ public class ExportSymbols extends GhidraScript {
                 mode = "$d";
             }
             if (mode == null || size <= 0) continue;
+            MemoryBlock segment = getMemoryBlock(addr);
             symbolCounts.computeIfAbsent(name, k -> new ArrayList<>())
-                    .add(new SymbolData(addr, name, mode, size));
+                    .add(new SymbolData(addr, name, mode, size, segment.getName()));
         }
 
         List<SymbolData> symbols = new ArrayList<>();
