@@ -146,8 +146,16 @@ public class ExportSymbols extends GhidraScript {
             }
             if (mode == null || size <= 0) continue;
             MemoryBlock segment = getMemoryBlock(addr);
+            String segName = ".text";
+            if (segment != null) {
+                segName = segment.getName();
+            } else {
+                printf("No block at address %s! The output of" +
+                        "this address will likely be incorrect, as it was set" +
+                        "to .text by default!", addr);
+            }
             symbolCounts.computeIfAbsent(name, k -> new ArrayList<>())
-                    .add(new SymbolData(addr, name, mode, size, segment.getName()));
+                    .add(new SymbolData(addr, name, mode, size, segName));
         }
 
         List<SymbolData> symbols = new ArrayList<>();
