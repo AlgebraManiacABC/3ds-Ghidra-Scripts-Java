@@ -137,9 +137,9 @@ public class ExportSymbols extends GhidraScript {
                         if (segment != null) {
                             segName = segment.getName();
                         } else {
-                            printf("No block at address %s! The output of" +
+                            printf("No block at address %s - The output of" +
                                     "this address will likely be incorrect, as it was set" +
-                                    "to .text by default!", addr);
+                                    "to .text by default!\n", addr);
                         }
                         symbolCounts.computeIfAbsent(ranged_name, k -> new ArrayList<>())
                                 .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size, segName));
@@ -158,9 +158,9 @@ public class ExportSymbols extends GhidraScript {
             if (segment != null) {
                 segName = segment.getName();
             } else {
-                printf("No block at address %s! The output of" +
+                printf("No block at address %s - The output of" +
                         "this address will likely be incorrect, as it was set" +
-                        "to .text by default!", addr);
+                        "to .text by default!\n", addr);
             }
             symbolCounts.computeIfAbsent(name, k -> new ArrayList<>())
                     .add(new SymbolData(addr, name, mode, size, segName));
