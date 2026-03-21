@@ -22,7 +22,7 @@ import java.util.stream.StreamSupport;
 
 public class ExportSymbols extends GhidraScript {
 
-    class SymbolData {
+    class SymbolData implements Comparable<SymbolData> {
         Address addr;
         String name;
         String mode;
@@ -35,6 +35,10 @@ public class ExportSymbols extends GhidraScript {
             this.mode = mode;
             this.size = size;
             this.segment = segment;
+        }
+
+        public int compareTo(SymbolData other) {
+            return Math.toIntExact(this.addr.subtract(other.addr));
         }
 
         @Override
@@ -76,9 +80,7 @@ public class ExportSymbols extends GhidraScript {
             PrintWriter out = new PrintWriter(new FileWriter(outFile));
             out.println("Location,Name,Mode,Size,Segment");
             List<SymbolData> symbols = extractSymbols(currentProgram, unique);
-            for (SymbolData symbol : symbols) {
-                out.println(symbol);
-            }
+            symbols.stream().sorted().forEach(out::println);
             out.close();
         }
 
