@@ -109,7 +109,9 @@ public class ExportSymbols extends GhidraScript {
             long size = 0;
             if (cu instanceof Instruction) {
                 if (f == null) continue;
-                if (f.isThunk()) name += "_" + addr;
+                if (unique && f.isThunk() && !f.getName()
+                        .contains(f.getSymbol().getAddress().toString()))
+                    name += "_" + addr;
                 var rv = program.getProgramContext().getRegisterValue(tmode, addr);
                 if (rv != null) {
                     BigInteger val = rv.getUnsignedValue();
