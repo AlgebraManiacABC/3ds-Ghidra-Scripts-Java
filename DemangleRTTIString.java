@@ -1,4 +1,4 @@
-//@category 3DS
+//@category RTTI
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
