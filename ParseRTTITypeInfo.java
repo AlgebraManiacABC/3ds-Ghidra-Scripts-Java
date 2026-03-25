@@ -8,10 +8,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.CategoryPath;
-import ghidra.program.model.symbol.Namespace;
-import ghidra.program.model.symbol.Symbol;
-import ghidra.program.model.symbol.SymbolTable;
-import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.*;
 import ghidra.program.model.mem.Memory;
 
 import java.util.*;
@@ -61,15 +58,27 @@ public class ParseRTTITypeInfo extends GhidraScript {
         // Read vtable pointer at offset 0
         long vtableAddr = Integer.toUnsignedLong(mem.getInt(addr));
 
+        // If vtable pointer is zero or OnUnresolved, try to resolve
+        // via external reference
+        long resolvedVtableAddr = vtableAddr;
+        if (vtableAddr == 0 || isOnUnresolved(vtableAddr)) {
+            Long extAddr = resolveExternalReference(addr);
+            if (extAddr != null) {
+                resolvedVtableAddr = extAddr;
+            } else {
+                println("Couldn't resolve vtableAddr at " + addr);
+            }
+        }
+
         // Determine struct base type (class, si, or vmi)
-        String baseType = vtableMap.get(vtableAddr);
+        String baseType = vtableMap.get(resolvedVtableAddr);
         if (baseType == null) {
-            baseType = askForStructType(addr, vtableAddr);
+            baseType = askForStructType(addr, resolvedVtableAddr);
             if (baseType == null) {
                 printerr("Cancelled at " + addr);
                 return null;
             }
-            vtableMap.put(vtableAddr, baseType);
+            vtableMap.put(resolvedVtableAddr, baseType);
         }
 
         // Resolve actual struct name — for __vmi, read base_count at offset 12
@@ -143,6 +152,22 @@ public class ParseRTTITypeInfo extends GhidraScript {
         }
 
         return addr.add(structSize);
+    }
+
+    private boolean isOnUnresolved(long addr) {
+        Symbol sym = getSymbolAt(toAddr(addr));
+        return sym.getName().equals("OnUnresolved");
+    }
+
+    private Long resolveExternalReference(Address addr) {
+        ReferenceManager refMgr = currentProgram.getReferenceManager();
+        Reference[] refs = refMgr.getReferencesFrom(addr);
+        for (Reference ref : refs) {
+            if (ref instanceof ExternalReference extRef) {
+                return extRef.getExternalLocation().getAddress().getOffset();
+            }
+        }
+        return null;
     }
 
     private String askForStructType(Address addr, long vtableAddr) throws Exception {

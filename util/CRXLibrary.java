@@ -212,7 +212,7 @@ public class CRXLibrary {
                 program.endTransaction(tx_id, true);
             }
         } else {
-            name = symbols[0].getName();
+            name = symbols[0].getName(true);
         }
         return name;
     }
