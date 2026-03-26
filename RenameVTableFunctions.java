@@ -8,6 +8,7 @@ import ghidra.app.util.NamespaceUtils;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined4DataType;
 import ghidra.program.model.listing.*;
@@ -259,7 +260,7 @@ public class RenameVTableFunctions extends GhidraScript {
         }
     }
 
-    private void collectTypeinfoSymbols(Program program) {
+    private void collectTypeinfoSymbols(Program program) throws Exception {
         SymbolIterator iter = program.getSymbolTable().getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol sym = iter.next();
@@ -270,6 +271,9 @@ public class RenameVTableFunctions extends GhidraScript {
 
             long addr = sym.getAddress().getOffset();
             String className = ns.getName(true);
+            if (ns instanceof Library) {
+                if (!sym.hasReferences()) continue;
+            }
 
             // Avoid overwriting code.bin entries with CRO entries
             if (!typeinfoToClassName.containsKey(addr)) {
@@ -868,7 +872,18 @@ public class RenameVTableFunctions extends GhidraScript {
                 // Not an ancestor — find common ancestor and re-home
                 String common = findCommonAncestor(existingClassName, className);
                 if (common != null) {
+                    println("  RE-HOME: " + existingClassName + " + " + className +
+                            " -> " + common);
                     Namespace commonNs = classNamespaces.get(common);
+                    if (commonNs == null) {
+                        // Ancestor namespace doesn't exist locally — create it
+                        try {
+                            commonNs = createNamespace(currentProgram.getGlobalNamespace(), common);
+                            classNamespaces.put(common, commonNs);
+                        } catch (Exception e) {
+                            println("    FAILED: could not create namespace " + common);
+                        }
+                    }
                     if (commonNs != null) {
                         // Remove old label, create under common ancestor
                         Symbol oldSym = null;
@@ -884,8 +899,16 @@ public class RenameVTableFunctions extends GhidraScript {
                             symTable.createLabel(funcAddr, oldName, commonNs,
                                     SourceType.USER_DEFINED);
                             renameCount++; // count the re-home
+                            println("    DONE: " + funcAddr + " -> " +
+                                    commonNs.getName(true) + "::" + oldName);
+                        } else {
+                            println("    FAILED: no symbol to re-home at " + funcAddr);
                         }
+                    } else {
+                        println("    FAILED: no common namespace at " + funcAddr);
                     }
+                } else {
+                    println("  NO COMMON ANCESTOR: " + existingClassName + " + " + className);
                 }
                 skipCount++;
                 continue;

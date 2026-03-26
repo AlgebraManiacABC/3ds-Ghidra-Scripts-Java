@@ -15,6 +15,7 @@ import java.util.*;
 
 public class ParseRTTITypeInfo extends GhidraScript {
 
+    private static final int PTR_SIZE = 4;
     private static final String OPTIONS_KEY = "RTTI_VTABLE_MAP";
     private static final CategoryPath TYPE_INFO_PATH = new CategoryPath("/type_info");
 
@@ -107,12 +108,43 @@ public class ParseRTTITypeInfo extends GhidraScript {
             return null;
         }
 
+        // Save external references first — applying the struct will clobber them
+        ReferenceManager refMgr = currentProgram.getReferenceManager();
+        Map<Address, List<Reference>> savedExtRefs = new HashMap<>();
+        for (long offset = 0; offset < structSize; offset += PTR_SIZE) {
+            Address fieldAddr = addr.add(offset);
+            Reference[] refs = refMgr.getReferencesFrom(fieldAddr);
+            for (Reference ref : refs) {
+                if (ref instanceof ExternalReference) {
+                    savedExtRefs.computeIfAbsent(fieldAddr, k -> new ArrayList<>())
+                            .add(ref);
+                }
+            }
+        }
+
         // Clear existing data at the location
         currentProgram.getListing().clearCodeUnits(addr, structEnd, false);
 
         // Apply the struct
         currentProgram.getListing().createData(addr, dt);
         println("Applied " + structName + " at " + addr);
+
+        // Restore external references
+        for (Map.Entry<Address, List<Reference>> entry : savedExtRefs.entrySet()) {
+            Address fieldAddr = entry.getKey();
+            for (Reference ref : entry.getValue()) {
+                if (ref instanceof ExternalReference extRef) {
+                    refMgr.addExternalReference(
+                            fieldAddr,
+                            extRef.getLibraryName(),
+                            extRef.getLabel(),
+                            extRef.getExternalLocation().getAddress(),
+                            extRef.getSource(),
+                            ref.getOperandIndex(),
+                            ref.getReferenceType());
+                }
+            }
+        }
 
         // Read the name pointer (offset 4) and derive the label
         long namePtr = Integer.toUnsignedLong(mem.getInt(addr.add(4)));
