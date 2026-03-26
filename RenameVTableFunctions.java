@@ -516,13 +516,7 @@ public class RenameVTableFunctions extends GhidraScript {
             } else {
                 Data curdata = getDataAt(current);
                 if (curdata == null) {
-                    ReferenceManager refMan = currentProgram.getReferenceManager();
-                    for (Reference ref : refMan.getReferencesFrom(current)) {
-                        if (ref instanceof ExternalReference) {
-                            createData(current, Undefined4DataType.dataType);
-                            break;
-                        }
-                    }
+                    createData(current, Undefined4DataType.dataType);
                 }
             }
 
