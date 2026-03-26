@@ -4,17 +4,17 @@
 // @author Claude (for AlgebraManiacABC)
 
 import ghidra.app.script.GhidraScript;
+import ghidra.app.util.NamespaceUtils;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.Data;
-import ghidra.program.model.listing.Library;
-import ghidra.program.model.listing.Listing;
-import ghidra.program.model.listing.Program;
+import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.data.Undefined4DataType;
+import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
-import ghidra.util.exception.InvalidInputException;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -40,6 +40,8 @@ public class RenameVTableFunctions extends GhidraScript {
     private final Map<String, List<List<Long>>> allVtableSlots = new HashMap<>();
     // class name -> primary vtable slot values (list of raw pointer values)
     private final Map<String, List<Long>> vtableSlots = new HashMap<>();
+    // class name -> list of address points for each sub-vtable
+    private final Map<String, List<Address>> allVtableAddressPoints = new HashMap<>();
     // class name -> address of first slot (address point)
     private final Map<String, Address> vtableAddressPoints = new HashMap<>();
     // class name -> Namespace object
@@ -49,6 +51,8 @@ public class RenameVTableFunctions extends GhidraScript {
     private final Set<Long> typeinfoAddresses = new HashSet<>();
     // Address of __cxa_pure_virtual (with thumb bit masked)
     private long pureVirtualAddr = 0;
+    // Whether __cxa_pure_virtual is external
+    private boolean externalPureVirtual = false;
     // Vtable region bounds
     private long vtableRegionStart;
     private long vtableRegionEnd;
@@ -180,6 +184,24 @@ public class RenameVTableFunctions extends GhidraScript {
             }
         }
 
+        // Not found in the symbol table; could be external
+        ReferenceManager refMan = currentProgram.getReferenceManager();
+        ReferenceIterator refIter = refMan.getExternalReferences();
+        while (refIter.hasNext()) {
+            if (refIter.next() instanceof ExternalReference extRef) {
+                String name = extRef.getLabel();
+                if (name.contains("__cxa_pure_virtual")) {
+                    pureVirtualAddr = extRef.getExternalLocation()
+                            .getAddress().getOffset();
+                    externalPureVirtual = true;
+                    println("Found __cxa_pure_virtual at 0x" +
+                            Long.toHexString(pureVirtualAddr) +
+                            " within " + extRef.getLibraryName());
+                    return;
+                }
+            }
+        }
+
         // Not found — ask user
         Address addr = askAddress("__cxa_pure_virtual",
                 "Could not find __cxa_pure_virtual symbol.\n" +
@@ -197,6 +219,22 @@ public class RenameVTableFunctions extends GhidraScript {
     private boolean isPureVirtual(long funcPtr) {
         if (pureVirtualAddr == 0) return false;
         // Mask off thumb bit for comparison
+        return (funcPtr & ~1L) == (pureVirtualAddr & ~1L);
+    }
+
+    private boolean isPureVirtualRef(Address addr) throws MemoryAccessException {
+        if (pureVirtualAddr == 0) return false;
+        if (externalPureVirtual) {
+            Reference[] refs = getReferencesFrom(addr);
+            for (Reference ref : refs) {
+                if (ref instanceof ExternalReference extRef) {
+                    if (extRef.getExternalLocation().getAddress().equals(addr))
+                        return true;
+                }
+            }
+            return false;
+        }
+        long funcPtr = getInt(addr);
         return (funcPtr & ~1L) == (pureVirtualAddr & ~1L);
     }
 
@@ -469,6 +507,21 @@ public class RenameVTableFunctions extends GhidraScript {
         while (current.getOffset() <= endAddr.getOffset() - PTR_SIZE) {
             long value = Integer.toUnsignedLong(mem.getInt(current));
             EntryType cls = classifyEntry(value);
+            if (cls == EntryType.FUNC_PTR || cls == EntryType.TYPEINFO_PTR) {
+                clearListing(current);
+                createData(current,PointerDataType.dataType);
+            } else {
+                Data curdata = getDataAt(current);
+                if (curdata == null) {
+                    ReferenceManager refMan = currentProgram.getReferenceManager();
+                    for (Reference ref : refMan.getReferencesFrom(current)) {
+                        if (ref instanceof ExternalReference extRef) {
+                            createData(current, Undefined4DataType.dataType);
+                            break;
+                        }
+                    }
+                }
+            }
 
             entryAddrs.add(current);
             entryValues.add(value);
@@ -513,7 +566,7 @@ public class RenameVTableFunctions extends GhidraScript {
                     // Offset — could be pure_virtual which lands in code
                     // or we've hit the prefix of the next sub-vtable.
                     // Check if it's pure virtual
-                    if (isPureVirtual(entryValues.get(i))) {
+                    if (isPureVirtualRef(entryAddrs.get(i))) {
                         if (addressPoint == null) {
                             addressPoint = entryAddrs.get(i);
                         }
@@ -529,6 +582,8 @@ public class RenameVTableFunctions extends GhidraScript {
             if (!slots.isEmpty() && addressPoint != null) {
                 allVtableSlots.computeIfAbsent(className, k -> new ArrayList<>())
                         .add(slots);
+                allVtableAddressPoints.computeIfAbsent(className, k -> new ArrayList<>())
+                        .add(addressPoint);
                 if (!seenPrimary.contains(className)) {
                     seenPrimary.add(className);
                     vtableSlots.put(className, slots);
@@ -558,6 +613,34 @@ public class RenameVTableFunctions extends GhidraScript {
         }
     }
 
+    /**
+     * Check if a function calls operator delete (indicating it's a D0 deleting destructor).
+     */
+    private boolean callsOperatorDelete(Address funcAddr) {
+        try {
+            Function func = getFunctionAt(funcAddr);
+            if (func == null) return false;
+
+            InstructionIterator iter =
+                    currentProgram.getListing().getInstructions(func.getBody(), true);
+            while (iter.hasNext()) {
+                Instruction inst = iter.next();
+                FlowType flow = inst.getFlowType();
+                if (flow.isCall() || flow.isJump()) {
+                    for (Address target : inst.getFlows()) {
+                        Symbol sym = getSymbolAt(target);
+                        if (sym != null && sym.getName().equals("operator.delete")) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return false;
+    }
+
     private void collectNamespaces() {
         SymbolIterator iter = symTable.getAllSymbols(false);
         while (iter.hasNext()) {
@@ -566,11 +649,19 @@ public class RenameVTableFunctions extends GhidraScript {
             Namespace ns = sym.getParentNamespace();
             if (ns == null || ns.isGlobal()) continue;
             String className = ns.getName(true);
+            // Convert to class namespace if it isn't already
+            if (!(ns instanceof GhidraClass)) {
+                try {
+                    ns = NamespaceUtils.convertNamespaceToClass(ns);
+                } catch (Exception e) {
+                    println("WARNING: Could not convert " + className + " to class");
+                }
+            }
             classNamespaces.put(className, ns);
         }
     }
 
-    private void processClass(String className) throws InvalidInputException {
+    private void processClass(String className) throws Exception {
         if (processed.contains(className)) return;
         processed.add(className);
 
@@ -583,14 +674,6 @@ public class RenameVTableFunctions extends GhidraScript {
             return;
         }
 
-        // --- Primary sub-vtable (index 0) ---
-        List<Long> parentSlots = null;
-        List<String> parents = parentMap.get(className);
-        if (parents != null && !parents.isEmpty()) {
-            parentSlots = vtableSlots.get(parents.getFirst());
-        }
-        processSubVtable(className, ns, mySlots, parentSlots, true);
-
         // Label the primary vtable address point
         Address addressPoint = vtableAddressPoints.get(className);
         if (addressPoint != null) {
@@ -601,6 +684,15 @@ public class RenameVTableFunctions extends GhidraScript {
                 println("WARNING: Could not label vtable for " + className);
             }
         }
+
+        // --- Primary sub-vtable (index 0) ---
+        List<Long> parentSlots = null;
+        List<String> parents = parentMap.get(className);
+        if (parents != null && !parents.isEmpty()) {
+            parentSlots = vtableSlots.get(parents.getFirst());
+        }
+        processSubVtable(className, ns, addressPoint, mySlots, parentSlots, true);
+
 
         // --- Secondary sub-vtables ---
         List<List<Long>> allSubVtables = allVtableSlots.get(className);
@@ -620,19 +712,25 @@ public class RenameVTableFunctions extends GhidraScript {
             List<List<Long>> parentAllSubVtables = allVtableSlots.get(parent);
             if (parentAllSubVtables != null) {
                 // Match secondary sub-vtables 1:1 against parent's secondaries
+                List<Address> myAddressPoints = allVtableAddressPoints.get(className);
                 for (int s = 1; s < parentAllSubVtables.size() && s < allSubVtables.size(); s++) {
-                    processSubVtable(className, ns, allSubVtables.get(s),
+                    Address secAddr = (myAddressPoints != null && s < myAddressPoints.size())
+                            ? myAddressPoints.get(s) : null;
+                    processSubVtable(className, ns, secAddr, allSubVtables.get(s),
                             parentAllSubVtables.get(s), false);
                 }
                 return;
             }
         }
 
+        List<Address> myAddressPoints = allVtableAddressPoints.get(className);
         for (int s = 0; s < secondaryBaseOrder.size() && s + 1 < allSubVtables.size(); s++) {
             String baseClassName = secondaryBaseOrder.get(s);
             List<Long> secondarySlots = allSubVtables.get(s + 1);
             List<Long> baseSlots = vtableSlots.get(baseClassName);
-            processSubVtable(className, ns, secondarySlots, baseSlots, false);
+            Address secAddr = (myAddressPoints != null && s + 1 < myAddressPoints.size())
+                    ? myAddressPoints.get(s + 1) : null;
+            processSubVtable(className, ns, secAddr, secondarySlots, baseSlots, false);
         }
     }
 
@@ -691,22 +789,40 @@ public class RenameVTableFunctions extends GhidraScript {
         }
     }
 
-    private void processSubVtable(String className, Namespace ns,
+    private void processSubVtable(String className, Namespace ns, Address start,
                                   List<Long> mySlots, List<Long> parentSlots,
-                                  boolean isPrimary) throws InvalidInputException {
+                                  boolean isPrimary) throws Exception {
         // (same slot-by-slot logic as the old processClass body)
         int parentSlotCount = (parentSlots != null) ? parentSlots.size() : 0;
         for (int i = 0; i < mySlots.size(); i++) {
             long funcPtr = mySlots.get(i);
-            if (isPureVirtual(funcPtr)) { pureVirtualCount++; continue; }
+            Address slotAddr = start.add(4L * i);
+            if (isPureVirtualRef(slotAddr)) { pureVirtualCount++; continue; }
             if (i < parentSlotCount) {
                 if (funcPtr == parentSlots.get(i)) { skipCount++; continue; }
             }
             Address funcAddr = toAddr(funcPtr & ~1L);
 
-            if (getFunctionAt(funcAddr) == null) {
-                try { disassemble(funcAddr); createFunction(funcAddr, null); }
+            Function func = getFunctionAt(funcAddr);
+            if (func == null) {
+                try { disassemble(funcAddr); func = createFunction(funcAddr, null); }
                 catch (Exception e) { println("WARNING: Could not create function at " + funcAddr); }
+            }
+
+            // Set calling convention to __thiscall
+            if (func != null) {
+                try {
+                    if (!"__thiscall".equals(func.getCallingConventionName())) {
+                        func.updateFunction("__thiscall",
+                                null,
+                                List.of(),
+                                Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                                true,
+                                SourceType.USER_DEFINED);
+                    }
+                } catch (Exception e) {
+                    // may already be set or unsupported
+                }
             }
 
             boolean alreadyNamed = false;
@@ -751,22 +867,38 @@ public class RenameVTableFunctions extends GhidraScript {
                 continue;
             }
 
-            String labelName;
-            if (i == 0) labelName = isPrimary ? "D1" : String.format("D1_%s", funcAddr);
-            else if (i == 1) labelName = isPrimary ? "D0" : String.format("D0_%s", funcAddr);
-            else labelName = null;
+            boolean D1 = (i == 0);
+            boolean D0 = (i == 1 && callsOperatorDelete(funcAddr));
+            String name = D1 && isPrimary ? "D1"
+                    : D0 && isPrimary ? "D0"
+                    : D1 ? String.format("D1_%s", funcAddr)
+                    : D0 ? String.format("D0_%s", funcAddr)
+                    : null; // keep default
             try {
-                if (labelName != null) {
-                    Symbol sym = getSymbolAt(funcAddr);
+                Symbol sym = getSymbolAt(funcAddr);
+                if (sym != null) {
                     sym.setNamespace(ns);
-                    sym.setName(labelName, SourceType.USER_DEFINED);
+                    String symName = sym.getName();
+                    String prefix = ns.getName() + "::";
+                    if (name != null) {
+                        // We can safely replace this label
+                        if (sym.getName().startsWith("FUN_") || sym.getName().startsWith("thunk_"))  {
+                            sym.setName(name, SourceType.USER_DEFINED);
+                        }
+                        symName = sym.getName();
+                    }
+                    if (symName.contains(prefix)) {
+                        String sliced = symName.substring(
+                                symName.lastIndexOf(prefix) + prefix.length());
+                        sym.setName(sliced, SourceType.USER_DEFINED);
+                    }
                 } else {
-                    labelName = String.format("FUN_%s", funcAddr);
-                    symTable.createLabel(funcAddr, labelName, ns, SourceType.USER_DEFINED);
+                    if (name == null) name = String.format("FUN_%s", funcAddr);
+                    symTable.createLabel(funcAddr, name, ns, SourceType.USER_DEFINED);
                 }
                 renameCount++;
             } catch (Exception e) {
-                println("ERROR: Could not create label " + ns.getName(true) + "::" + labelName);
+                println("ERROR: Could not create label " + ns.getName(true) + "::" + name);
             }
         }
     }
