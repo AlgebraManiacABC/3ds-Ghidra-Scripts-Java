@@ -8,7 +8,6 @@ import ghidra.app.util.NamespaceUtils;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined4DataType;
 import ghidra.program.model.listing.*;
@@ -217,12 +216,6 @@ public class RenameVTableFunctions extends GhidraScript {
         }
     }
 
-    private boolean isPureVirtual(long funcPtr) {
-        if (pureVirtualAddr == 0) return false;
-        // Mask off thumb bit for comparison
-        return (funcPtr & ~1L) == (pureVirtualAddr & ~1L);
-    }
-
     private boolean isPureVirtualRef(Address addr) throws MemoryAccessException {
         if (pureVirtualAddr == 0) return false;
         if (externalPureVirtual) {
@@ -260,7 +253,7 @@ public class RenameVTableFunctions extends GhidraScript {
         }
     }
 
-    private void collectTypeinfoSymbols(Program program) throws Exception {
+    private void collectTypeinfoSymbols(Program program) {
         SymbolIterator iter = program.getSymbolTable().getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol sym = iter.next();
