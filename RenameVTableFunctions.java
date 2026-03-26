@@ -931,5 +931,49 @@ public class RenameVTableFunctions extends GhidraScript {
                 println("ERROR: Could not create label " + ns.getName(true) + "::" + name);
             }
         }
+
+        // Create an array of pointers for this sub-vtable
+        if (start != null && !mySlots.isEmpty()) {
+            try {
+                int arraySize = mySlots.size();
+                Address arrayEnd = start.add((long) arraySize * PTR_SIZE - 1);
+
+                // Save external references
+                ReferenceManager refMgr = currentProgram.getReferenceManager();
+                Map<Address, List<Reference>> savedExtRefs = new HashMap<>();
+                for (int j = 0; j < arraySize; j++) {
+                    Address slotAddr = start.add((long) j * PTR_SIZE);
+                    for (Reference ref : refMgr.getReferencesFrom(slotAddr)) {
+                        if (ref instanceof ExternalReference) {
+                            savedExtRefs.computeIfAbsent(slotAddr, k -> new ArrayList<>())
+                                    .add(ref);
+                        }
+                    }
+                }
+
+                // Clear and apply array
+                clearListing(start, arrayEnd);
+                createData(start, new ghidra.program.model.data.ArrayDataType(
+                        PointerDataType.dataType, arraySize, PTR_SIZE));
+
+                // Restore external references
+                for (Map.Entry<Address, List<Reference>> entry : savedExtRefs.entrySet()) {
+                    for (Reference ref : entry.getValue()) {
+                        if (ref instanceof ExternalReference extRef) {
+                            refMgr.addExternalReference(
+                                    entry.getKey(),
+                                    extRef.getLibraryName(),
+                                    extRef.getLabel(),
+                                    extRef.getExternalLocation().getAddress(),
+                                    extRef.getSource(),
+                                    ref.getOperandIndex(),
+                                    ref.getReferenceType());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                println("WARNING: Could not create vtable array at " + start);
+            }
+        }
     }
 }
