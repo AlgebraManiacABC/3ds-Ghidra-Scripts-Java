@@ -515,10 +515,22 @@ public class RenameVTableFunctions extends GhidraScript {
                 if (curdata == null) {
                     ReferenceManager refMan = currentProgram.getReferenceManager();
                     for (Reference ref : refMan.getReferencesFrom(current)) {
-                        if (ref instanceof ExternalReference extRef) {
+                        if (ref instanceof ExternalReference) {
                             createData(current, Undefined4DataType.dataType);
                             break;
                         }
+                    }
+                }
+            }
+
+            // In CROs, zero values may be external function/pure-virtual pointers
+            if (cls == EntryType.OFFSET && value == 0) {
+                Reference[] refs = currentProgram.getReferenceManager()
+                        .getReferencesFrom(current);
+                for (Reference ref : refs) {
+                    if (ref instanceof ExternalReference) {
+                        cls = EntryType.FUNC_PTR;
+                        break;
                     }
                 }
             }
@@ -721,6 +733,16 @@ public class RenameVTableFunctions extends GhidraScript {
                 }
                 return;
             }
+            // Parent vtable data not available (e.g., in another module)
+            // Process secondary sub-vtables without parent comparison
+            List<Address> myAddressPoints = allVtableAddressPoints.get(className);
+            for (int s = 1; s < allSubVtables.size(); s++) {
+                Address secAddr = (myAddressPoints != null && s < myAddressPoints.size())
+                        ? myAddressPoints.get(s) : null;
+                processSubVtable(className, ns, secAddr, allSubVtables.get(s),
+                        null, false);
+            }
+            return;
         }
 
         List<Address> myAddressPoints = allVtableAddressPoints.get(className);
@@ -798,6 +820,8 @@ public class RenameVTableFunctions extends GhidraScript {
             long funcPtr = mySlots.get(i);
             Address slotAddr = start.add(4L * i);
             if (isPureVirtualRef(slotAddr)) { pureVirtualCount++; continue; }
+            // Skip external function pointers (zero value with external ref)
+            if (funcPtr == 0) { skipCount++; continue; }
             if (i < parentSlotCount) {
                 if (funcPtr == parentSlots.get(i)) { skipCount++; continue; }
             }
