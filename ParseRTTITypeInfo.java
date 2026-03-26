@@ -61,11 +61,13 @@ public class ParseRTTITypeInfo extends GhidraScript {
 
         // If vtable pointer is zero or OnUnresolved, try to resolve
         // via external reference
+        boolean isExternal = false;
         long resolvedVtableAddr = vtableAddr;
         if (vtableAddr == 0 || isOnUnresolved(vtableAddr)) {
             Long extAddr = resolveExternalReference(addr);
             if (extAddr != null) {
                 resolvedVtableAddr = extAddr;
+                isExternal = true;
             } else {
                 println("Couldn't resolve vtableAddr at " + addr);
             }
@@ -73,6 +75,13 @@ public class ParseRTTITypeInfo extends GhidraScript {
 
         // Determine struct base type (class, si, or vmi)
         String baseType = vtableMap.get(resolvedVtableAddr);
+        if (baseType == null) {
+            if (isExternal) {
+                baseType = getExternalStructType(addr);
+            } else {
+                baseType = getInternalStructType(addr);
+            }
+        }
         if (baseType == null) {
             baseType = askForStructType(addr, resolvedVtableAddr);
             if (baseType == null) {
@@ -184,6 +193,29 @@ public class ParseRTTITypeInfo extends GhidraScript {
         }
 
         return addr.add(structSize);
+    }
+
+    private String getExternalStructType(Address addr) {
+        ReferenceManager refMan = currentProgram.getReferenceManager();
+        for (var ref : refMan.getReferencesFrom(addr)) {
+            if (ref instanceof ExternalReference extRef) {
+                String label = extRef.getLabel();
+                if (label.contains("__vmi")) return "__vmi_class_type_info";
+                if (label.contains("__si")) return "__si_class_type_info";
+                if (label.contains("__class")) return "__class_type_info";
+            }
+        }
+        return null;
+    }
+
+    private String getInternalStructType(Address addr) {
+        for(var sym : currentProgram.getSymbolTable().getSymbols(addr)) {
+            String label = sym.getName();
+            if (label.contains("__vmi")) return "__vmi_class_type_info";
+            if (label.contains("__si")) return "__si_class_type_info";
+            if (label.contains("__class")) return "__class_type_info";
+        }
+        return null;
     }
 
     private boolean isOnUnresolved(long addr) {
