@@ -86,10 +86,16 @@ public class RenameVTableFunctions extends GhidraScript {
         findPureVirtual();
 
         // Step 2: Get vtable region bounds
-        Address startAddr = askAddress("Vtable Region Start",
-                "Enter the start address of the vtable region:");
-        Address endAddr = askAddress("Vtable Region End",
-                "Enter the end address of the vtable region:");
+        Address startAddr, endAddr;
+        if (currentSelection != null) {
+            startAddr = currentSelection.getMinAddress();
+            endAddr = currentSelection.getMaxAddress();
+        } else {
+            startAddr = askAddress("Vtable Region Start",
+                    "Enter the start address of the vtable region:");
+            endAddr = askAddress("Vtable Region End",
+                    "Enter the end address of the vtable region:");
+        }
         vtableRegionStart = startAddr.getOffset();
         vtableRegionEnd = endAddr.getOffset();
 
