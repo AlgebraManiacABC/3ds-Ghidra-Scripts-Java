@@ -183,18 +183,20 @@ public class CRXLibrary {
         if (symbols.length == 0) {
             // No symbol. Need to create one
             if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
-                Function func = program.getListing().getFunctionAt(addr);
+                Address funcAddr = addr;
+                if ((addr.getOffset() & 1L) == 1) funcAddr = funcAddr.subtract(1);
+                Function func = program.getListing().getFunctionAt(funcAddr);
                 if (func != null) return func.getName();
                 // Disassemble first, if needed
-                boolean disassembled = program.getListing().getInstructionAt(addr) != null;
+                boolean disassembled = program.getListing().getInstructionAt(funcAddr) != null;
                 if (!disassembled) {
-                    disassemble(addr, (addr.getOffset() & 0x1) == 1);
+                    disassemble(funcAddr, (addr.getOffset() & 0x1) == 1);
                 }
                 // Create function, get name
-                createFunctionHere(null, addr);
-                func = program.getListing().getFunctionAt(addr);
+                createFunctionHere(null, funcAddr);
+                func = program.getListing().getFunctionAt(funcAddr);
                 if (func == null) {
-                    return String.format("INVALID_%s_%s",this.name,segOff);
+                    return String.format("INVALID_%s_%s",this.name,funcAddr);
                 }
                 return func.getName();
             } else {
