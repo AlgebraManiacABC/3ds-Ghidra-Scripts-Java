@@ -12,14 +12,16 @@
 
 package util;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.NamespaceUtils;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.PointerDataType;
-import ghidra.program.model.data.Undefined4DataType;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
@@ -34,8 +36,9 @@ public class RenameVTableFunctions {
 
     private final GhidraScript script;
 
+    private SymbolTable symTab;
     private Memory mem;
-    private SymbolTable symTable;
+    private Program program;
 
     // typeinfo address -> class name (fully qualified)
     private final Map<Long, String> typeinfoToClassName = new HashMap<>();
@@ -81,9 +84,11 @@ public class RenameVTableFunctions {
      * @param vtableRttiSlots  Map of vtable RTTI slot address -> typeinfo address
      * @param knownTypeinfos   Set of all known typeinfo struct addresses
      */
-    public void run(Map<Long, Long> vtableRttiSlots, Set<Long> knownTypeinfos) throws Exception {
-        mem = script.getCurrentProgram().getMemory();
-        symTable = script.getCurrentProgram().getSymbolTable();
+    public void run(Program prog, Map<Long, Long> vtableRttiSlots, Set<Long> knownTypeinfos)
+            throws Exception {
+        program = prog;
+        symTab = prog.getSymbolTable();
+        mem = prog.getMemory();
         typeinfoAddresses.addAll(knownTypeinfos);
 
         // Step 1: Find __cxa_pure_virtual
@@ -166,9 +171,9 @@ public class RenameVTableFunctions {
         script.println("Unreached classes:      " + unreached);
 
         // Release CRO programs
-        for (Program prog : importedPrograms.values()) {
-            if (prog != null && prog != script.getCurrentProgram()) {
-                prog.release(script);
+        for (Program p : importedPrograms.values()) {
+            if (p != null && p != program) {
+                p.release(script);
             }
         }
     }
@@ -178,7 +183,7 @@ public class RenameVTableFunctions {
     // ---------------------------------------------------------------
 
     private void findPureVirtual() {
-        SymbolIterator iter = symTable.getAllSymbols(false);
+        SymbolIterator iter = program.getSymbolTable().getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol sym = iter.next();
             if (sym.getName().equals("__cxa_pure_virtual")) {
@@ -189,7 +194,7 @@ public class RenameVTableFunctions {
             }
         }
 
-        ReferenceManager refMan = script.getCurrentProgram().getReferenceManager();
+        ReferenceManager refMan = program.getReferenceManager();
         ReferenceIterator refIter = refMan.getExternalReferences();
         while (refIter.hasNext()) {
             if (refIter.next() instanceof ExternalReference extRef) {
@@ -212,7 +217,8 @@ public class RenameVTableFunctions {
     private boolean isPureVirtualRef(Address addr) throws MemoryAccessException {
         if (pureVirtualAddr == 0) return false;
         if (externalPureVirtual) {
-            Reference[] refs = script.getReferencesFrom(addr);
+            ReferenceManager refMan = program.getReferenceManager();
+            Reference[] refs = refMan.getReferencesFrom(addr);
             for (Reference ref : refs) {
                 if (ref instanceof ExternalReference extRef) {
                     if (extRef.getExternalLocation().getAddress().equals(addr))
@@ -222,7 +228,7 @@ public class RenameVTableFunctions {
             return false;
         }
         long funcPtr = script.toAddr(addr.getOffset()).getOffset();
-        funcPtr = Integer.toUnsignedLong(mem.getInt(addr));
+        funcPtr = Integer.toUnsignedLong(program.getMemory().getInt(addr));
         return (funcPtr & ~1L) == (pureVirtualAddr & ~1L);
     }
 
@@ -231,15 +237,15 @@ public class RenameVTableFunctions {
     // ---------------------------------------------------------------
 
     private void buildInheritanceTree() throws Exception {
-        collectTypeinfoSymbols(script.getCurrentProgram());
+        collectTypeinfoSymbols(program);
 
         for (Map.Entry<Long, String> entry :
                 new ArrayList<>(typeinfoToClassName.entrySet())) {
-            resolveParents(script.getCurrentProgram(), entry.getKey(), entry.getValue());
+            resolveParents(program, entry.getKey(), entry.getValue());
         }
 
         for (Program prog : importedPrograms.values()) {
-            if (prog != null && prog != script.getCurrentProgram()) {
+            if (prog != null && prog != program) {
                 prog.release(script);
             }
         }
@@ -298,17 +304,17 @@ public class RenameVTableFunctions {
 
         switch (rttiType) {
             case "__class_type_info" -> {}
-            case "__si_class_type_info" -> resolveBaseType(program, addr.add(8), className);
+            case "__si_class_type_info" -> resolveBaseType(addr.add(8), className);
             case "__vmi_class_type_info" -> {
                 int baseCount = progMem.getInt(addr.add(12));
                 for (int b = 0; b < baseCount; b++) {
-                    resolveBaseType(program, addr.add(16 + b * 8L), className);
+                    resolveBaseType(addr.add(16 + b * 8L), className);
                 }
             }
         }
     }
 
-    private void resolveBaseType(Program program, Address baseFieldAddr,
+    private void resolveBaseType(Address baseFieldAddr,
                                  String childClassName) throws Exception {
         Memory progMem = program.getMemory();
         long basePtr = Integer.toUnsignedLong(progMem.getInt(baseFieldAddr));
@@ -341,8 +347,12 @@ public class RenameVTableFunctions {
     }
 
     private boolean isOnUnresolved(long addr) {
-        Symbol sym = script.getSymbolAt(script.toAddr(addr));
-        return sym != null && sym.getName().equals("OnUnresolved");
+        Address realAddr = program.getMinAddress().getAddressSpace().getAddress(addr);
+        Symbol[] syms = symTab.getSymbols(realAddr);
+        if (syms != null && syms.length > 0) {
+            return syms[0].getName().equals("OnUnresolved");
+        }
+        return false;
     }
 
     private void addParentChild(String childName, String parentName) {
@@ -463,6 +473,7 @@ public class RenameVTableFunctions {
     private int propagateNames() throws Exception {
         int count = 0;
 
+        AddressSpace addressSpace = program.getMinAddress().getAddressSpace();
         // For each class that has vtable data, check each sub-vtable
         for (String className : processed) {
             List<List<Long>> subVtables = allVtableSlots.get(className);
@@ -477,7 +488,7 @@ public class RenameVTableFunctions {
                 for (int i = 0; i < slots.size(); i++) {
                     long funcPtr = slots.get(i);
                     if (funcPtr == 0) continue;
-                    Address funcAddr = script.toAddr(funcPtr & ~1L);
+                    Address funcAddr = addressSpace.getAddress(funcPtr & ~1L);
 
                     // Get the current name at this function
                     String name = getNonGenericName(funcAddr);
@@ -497,7 +508,7 @@ public class RenameVTableFunctions {
      * or null if generic/absent.
      */
     private String getNonGenericName(Address funcAddr) {
-        for (Symbol s : symTable.getSymbols(funcAddr)) {
+        for (Symbol s : symTab.getSymbols(funcAddr)) {
             String name = s.getName();
             if (name.startsWith("FUN_") || name.startsWith("thunk_")) continue;
             if (name.equals("D0") || name.equals("D1")) continue;
@@ -531,6 +542,7 @@ public class RenameVTableFunctions {
         if (!visited.add(ancestor)) return 0;
         int count = 0;
 
+        AddressSpace addressSpace = program.getMinAddress().getAddressSpace();
         // Check if this ancestor has the slot in the same sub-vtable
         List<List<Long>> subVtables = allVtableSlots.get(ancestor);
         List<Address> addressPoints = allVtableAddressPoints.get(ancestor);
@@ -543,7 +555,7 @@ public class RenameVTableFunctions {
             if (slotIdx < ancestorSlots.size() && ancestorBase != null) {
                 long funcPtr = ancestorSlots.get(slotIdx);
                 if (funcPtr != 0) {
-                    Address funcAddr = script.toAddr(funcPtr & ~1L);
+                    Address funcAddr = addressSpace.getAddress(funcPtr & ~1L);
 
                     // Only rename if the current name is generic
                     String currentName = getNonGenericName(funcAddr);
@@ -560,13 +572,17 @@ public class RenameVTableFunctions {
                             appliedName = "~" + leafName;
                         }
 
-                        Symbol sym = script.getSymbolAt(funcAddr);
-                        if (sym != null && (sym.getName().startsWith("FUN_") ||
-                                sym.getName().startsWith("thunk_"))) {
-                            sym.setName(appliedName, SourceType.USER_DEFINED);
-                            script.println("  " + ancestor + " slot " + slotIdx +
-                                    " -> " + appliedName);
-                            count++;
+                        SymbolTable symTab = program.getSymbolTable();
+                        Symbol[] syms = symTab.getSymbols(funcAddr);
+                        if (syms != null && syms.length > 0) {
+                            Symbol sym = syms[0];
+                            if (sym != null && (sym.getName().startsWith("FUN_") ||
+                                    sym.getName().startsWith("thunk_"))) {
+                                sym.setName(appliedName, SourceType.USER_DEFINED);
+                                script.println("  " + ancestor + " slot " + slotIdx +
+                                        " -> " + appliedName);
+                                count++;
+                            }
                         }
                     }
                 }
@@ -595,18 +611,20 @@ public class RenameVTableFunctions {
 
         Set<String> seenPrimary = new HashSet<>();
 
+        AddressSpace addressSpace = program.getMinAddress().getAddressSpace();
+        Listing listing = program.getListing();
         for (int r = 0; r < sortedSlotAddrs.size(); r++) {
             long rttiSlotAddr = sortedSlotAddrs.get(r);
             long typeinfoAddr = vtableRttiSlots.get(rttiSlotAddr);
             String className = typeinfoToClassName.get(typeinfoAddr);
             if (className == null) continue;
 
-            Address slotAddress = script.toAddr(rttiSlotAddr);
+            Address slotAddress = addressSpace.getAddress(rttiSlotAddr);
 
             // Apply pointer data type at the RTTI slot
             try {
-                script.clearListing(slotAddress);
-                script.createData(slotAddress, PointerDataType.dataType);
+                listing.clearCodeUnits(slotAddress,slotAddress,true);
+                listing.createData(slotAddress, PointerDataType.dataType);
             } catch (Exception e) { /* already applied */ }
 
             // Walk forward from the slot after the RTTI pointer to collect function pointers
@@ -618,15 +636,15 @@ public class RenameVTableFunctions {
             if (r + 1 < sortedSlotAddrs.size()) {
                 nextBoundary = sortedSlotAddrs.get(r + 1);
             } else {
-                MemoryBlock rodata = findRodataBlock();
+                MemoryBlock rodata = findRodataBlock(program);
                 nextBoundary = (rodata != null) ?
                         rodata.getEnd().getOffset() + 1 : rttiSlotAddr + 0x10000;
             }
 
             long current = rttiSlotAddr + PTR_SIZE;
             while (current < nextBoundary) {
-                Address currentAddr = script.toAddr(current);
-                long value = Integer.toUnsignedLong(mem.getInt(currentAddr));
+                Address currentAddr = addressSpace.getAddress(current);
+                long value = Integer.toUnsignedLong(program.getMemory().getInt(currentAddr));
 
                 if (isFunctionPointer(currentAddr, value)) {
                     if (addressPoint == null) {
@@ -637,10 +655,10 @@ public class RenameVTableFunctions {
                     // Apply pointer data type
                     try {
 
-                        if (script.getDataAt(currentAddr) != null) {
-                            script.clearListing(currentAddr);
+                        if (listing.getDataAt(currentAddr) != null) {
+                            listing.clearCodeUnits(currentAddr,currentAddr,true);
                         }
-                        script.createData(currentAddr, PointerDataType.dataType);
+                        listing.createData(currentAddr, PointerDataType.dataType);
                     } catch (Exception e) { /* already applied */ }
                 } else if (isPureVirtualRef(currentAddr)) {
                     if (addressPoint == null) {
@@ -674,7 +692,7 @@ public class RenameVTableFunctions {
      */
     private boolean isFunctionPointer(Address addr, long value) {
         // Check external reference first
-        ReferenceManager refMgr = script.getCurrentProgram().getReferenceManager();
+        ReferenceManager refMgr = program.getReferenceManager();
         for (Reference ref : refMgr.getReferencesFrom(addr)) {
             if (ref instanceof ExternalReference) {
                 return true;
@@ -687,7 +705,8 @@ public class RenameVTableFunctions {
 
     private boolean isExecutable(long value) {
         try {
-            Address targetAddr = script.toAddr(value);
+            AddressSpace addressSpace = program.getMinAddress().getAddressSpace();
+            Address targetAddr = addressSpace.getAddress(value);
             MemoryBlock block = mem.getBlock(targetAddr);
             return (block != null && block.isExecute());
         } catch (Exception e) {
@@ -695,8 +714,8 @@ public class RenameVTableFunctions {
         }
     }
 
-    private MemoryBlock findRodataBlock() {
-        Memory m = script.getCurrentProgram().getMemory();
+    private MemoryBlock findRodataBlock(Program program) {
+        Memory m = program.getMemory();
         for (MemoryBlock block : m.getBlocks()) {
             String name = block.getName();
             if (name.equals(".rodata") || name.equals("rodata")) {
@@ -716,7 +735,7 @@ public class RenameVTableFunctions {
     // ---------------------------------------------------------------
 
     private void collectNamespaces() {
-        SymbolIterator iter = symTable.getAllSymbols(false);
+        SymbolIterator iter = symTab.getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol sym = iter.next();
             if (!sym.getName().equals("typeinfo")) continue;
@@ -755,7 +774,7 @@ public class RenameVTableFunctions {
         Address addressPoint = vtableAddressPoints.get(className);
         if (addressPoint != null) {
             try {
-                symTable.createLabel(addressPoint, "vtable", ns, SourceType.USER_DEFINED);
+                symTab.createLabel(addressPoint, "vtable", ns, SourceType.USER_DEFINED);
             } catch (Exception e) {
                 script.println("WARNING: Could not label vtable for " + className);
             }
@@ -864,19 +883,23 @@ public class RenameVTableFunctions {
 
     private boolean callsOperatorDelete(Address funcAddr) {
         try {
-            Function func = script.getFunctionAt(funcAddr);
+            Function func = program.getListing().getFunctionAt(funcAddr);
             if (func == null) return false;
 
             InstructionIterator iter =
-                    script.getCurrentProgram().getListing().getInstructions(func.getBody(), true);
+                    program.getListing().getInstructions(func.getBody(), true);
             while (iter.hasNext()) {
                 Instruction inst = iter.next();
                 FlowType flow = inst.getFlowType();
                 if (flow.isCall() || flow.isJump()) {
                     for (Address target : inst.getFlows()) {
-                        Symbol sym = script.getSymbolAt(target);
-                        if (sym != null && sym.getName().equals("operator.delete")) {
-                            return true;
+                        Symbol[] syms = symTab.getSymbols(target);
+                        if (syms != null) {
+                            for (Symbol sym : syms) {
+                                if (sym.getName().equals("operator.delete")) {
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
@@ -887,8 +910,8 @@ public class RenameVTableFunctions {
         return false;
     }
 
-    private Namespace createNamespace(Namespace parent, String name) throws Exception {
-        return script.getCurrentProgram().getSymbolTable()
+    private Namespace createNamespace(Program program, Namespace parent, String name) throws Exception {
+        return program.getSymbolTable()
                 .createNameSpace(parent, name, SourceType.USER_DEFINED);
     }
 
@@ -896,6 +919,7 @@ public class RenameVTableFunctions {
                                   List<Long> mySlots, List<Long> parentSlots,
                                   boolean isPrimary) throws Exception {
         int parentSlotCount = (parentSlots != null) ? parentSlots.size() : 0;
+        AddressSpace addressSpace = program.getMinAddress().getAddressSpace();
         for (int i = 0; i < mySlots.size(); i++) {
             long funcPtr = mySlots.get(i);
             Address slotAddr = start.add(4L * i);
@@ -904,13 +928,16 @@ public class RenameVTableFunctions {
             if (i < parentSlotCount) {
                 if (funcPtr == parentSlots.get(i)) { skipCount++; continue; }
             }
-            Address funcAddr = script.toAddr(funcPtr & ~1L);
+            Address funcAddr = addressSpace.getAddress(funcPtr & ~1L);
 
-            Function func = script.getFunctionAt(funcAddr);
+            Function func = program.getListing().getFunctionAt(funcAddr);
             if (func == null) {
                 try {
-                    script.disassemble(funcAddr);
-                    func = script.createFunction(funcAddr, null);
+                    DisassembleCommand dCmd = new DisassembleCommand(funcAddr,null,true);
+                    dCmd.applyTo(program);
+                    CreateFunctionCmd fCmd = new CreateFunctionCmd(funcAddr);
+                    fCmd.applyTo(program);
+                    func = program.getListing().getFunctionAt(funcAddr);
                 } catch (Exception e) {
                     script.println("WARNING: Could not create function at " + funcAddr);
                 }
@@ -930,7 +957,7 @@ public class RenameVTableFunctions {
 
             boolean alreadyNamed = false;
             Namespace existingNs = null;
-            for (Symbol s : symTable.getSymbols(funcAddr)) {
+            for (Symbol s : symTab.getSymbols(funcAddr)) {
                 if (!s.getParentNamespace().isGlobal()) {
                     alreadyNamed = true;
                     existingNs = s.getParentNamespace();
@@ -948,8 +975,8 @@ public class RenameVTableFunctions {
                     Namespace commonNs = classNamespaces.get(common);
                     if (commonNs == null) {
                         try {
-                            commonNs = createNamespace(
-                                    script.getCurrentProgram().getGlobalNamespace(), common);
+                            commonNs = createNamespace(program,
+                                    program.getGlobalNamespace(), common);
                             classNamespaces.put(common, commonNs);
                         } catch (Exception e) {
                             script.println("    FAILED: could not create namespace " + common);
@@ -957,7 +984,7 @@ public class RenameVTableFunctions {
                     }
                     if (commonNs != null) {
                         Symbol oldSym = null;
-                        for (Symbol s : symTable.getSymbols(funcAddr)) {
+                        for (Symbol s : symTab.getSymbols(funcAddr)) {
                             if (s.getParentNamespace().equals(existingNs)) {
                                 oldSym = s;
                                 break;
@@ -966,7 +993,7 @@ public class RenameVTableFunctions {
                         if (oldSym != null) {
                             String oldName = oldSym.getName();
                             oldSym.delete();
-                            symTable.createLabel(funcAddr, oldName, commonNs,
+                            symTab.createLabel(funcAddr, oldName, commonNs,
                                     SourceType.USER_DEFINED);
                             renameCount++;
                         }
@@ -981,8 +1008,10 @@ public class RenameVTableFunctions {
                     : D0 ? String.format("D0_%s", funcAddr)
                     : null;
             try {
-                Symbol sym = script.getSymbolAt(funcAddr);
-                if (sym != null) {
+                SymbolTable symTab = program.getSymbolTable();
+                Symbol[] syms = symTab.getSymbols(funcAddr);
+                if (syms != null && syms.length > 0) {
+                    Symbol sym = syms[0];
                     sym.setNamespace(ns);
                     String symName = sym.getName();
                     String prefix = ns.getName() + "::";
@@ -999,7 +1028,7 @@ public class RenameVTableFunctions {
                     }
                 } else {
                     if (name == null) name = String.format("FUN_%s", funcAddr);
-                    symTable.createLabel(funcAddr, name, ns, SourceType.USER_DEFINED);
+                    symTab.createLabel(funcAddr, name, ns, SourceType.USER_DEFINED);
                 }
                 renameCount++;
             } catch (Exception e) {
@@ -1013,7 +1042,7 @@ public class RenameVTableFunctions {
                 int arraySize = mySlots.size();
                 Address arrayEnd = start.add((long) arraySize * PTR_SIZE - 1);
 
-                ReferenceManager refMgr = script.getCurrentProgram().getReferenceManager();
+                ReferenceManager refMgr = program.getReferenceManager();
                 Map<Address, List<Reference>> savedExtRefs = new HashMap<>();
                 for (int j = 0; j < arraySize; j++) {
                     Address slotAddr = start.add((long) j * PTR_SIZE);
@@ -1025,8 +1054,8 @@ public class RenameVTableFunctions {
                     }
                 }
 
-                script.clearListing(start, arrayEnd);
-                script.createData(start, new ArrayDataType(
+                program.getListing().clearCodeUnits(start, arrayEnd, true);
+                program.getListing().createData(start, new ArrayDataType(
                         PointerDataType.dataType, arraySize, PTR_SIZE));
 
                 for (Map.Entry<Address, List<Reference>> entry : savedExtRefs.entrySet()) {

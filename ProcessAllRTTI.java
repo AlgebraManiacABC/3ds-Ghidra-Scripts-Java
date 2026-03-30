@@ -25,7 +25,7 @@ public class ProcessAllRTTI extends GhidraScript {
     protected void run() throws Exception {
         // Steps 1-4: Discovery, demangling, struct creation, vtable finding
         RTTIUtil rtti = new RTTIUtil(this);
-        rtti.run();
+        rtti.run(currentProgram);
 
         Map<Long, Long> vtableRttiSlots = rtti.getVtableRttiSlots();
         Set<Long> typeinfoAddresses = rtti.getTypeinfoAddresses();
@@ -39,7 +39,7 @@ public class ProcessAllRTTI extends GhidraScript {
 
         // Step 5: Rename vtable functions
         RenameVTableFunctions renamer = new RenameVTableFunctions(this);
-        renamer.run(vtableRttiSlots, typeinfoAddresses);
+        renamer.run(currentProgram, vtableRttiSlots, typeinfoAddresses);
 
         println("\n=== All Done ===");
     }

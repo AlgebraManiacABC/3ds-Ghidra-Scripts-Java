@@ -10,12 +10,14 @@
 
 package util;
 
+import ghidra.app.cmd.data.CreateStringCmd;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Listing;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
@@ -60,11 +62,11 @@ public class RTTIUtil {
      * Run the full discovery pipeline: find typeinfos, demangle names,
      * create/apply struct types, discover vtables.
      */
-    public void run() throws Exception {
+    public void run(Program program) throws Exception {
         script.println("=== RTTI Discovery Pipeline ===\n");
 
         script.println("[1] Finding __cxxabiv1 typeinfo vtable addresses...");
-        findCxxabiVtableAddresses();
+        findCxxabiVtableAddresses(program);
         script.println("    Found " + cxxabiVtableAddrs.size() + " vtable address(es).\n");
 
         if (cxxabiVtableAddrs.isEmpty()) {
@@ -73,23 +75,23 @@ public class RTTIUtil {
         }
 
         script.println("[2] Scanning .rodata for typeinfo structs...");
-        scanForTypeinfoStructs();
+        scanForTypeinfoStructs(program);
         script.println("    Found " + discoveredTypeinfos.size() + " typeinfo struct(s).\n");
 
         script.println("[3] Demangling RTTI name strings...");
-        demangleNames();
+        demangleNames(program);
         script.println("    Processed " + nameStringAddrs.size() + " name string(s).\n");
 
         script.println("[4] Ensuring typeinfo data types exist...");
-        ensureTypeInfoDataTypes();
+        ensureTypeInfoDataTypes(program);
         script.println("    Done.\n");
 
         script.println("[5] Applying struct types to discovered typeinfos...");
-        applyTypeinfoStructs();
+        applyTypeinfoStructs(program);
         script.println("    Done.\n");
 
         script.println("[6] Discovering vtables in .rodata...");
-        discoverVtables();
+        discoverVtables(program);
         script.println("    Found " + vtableRttiSlots.size() + " vtable(s).\n");
 
         script.println("=== RTTI Discovery Complete ===");
@@ -114,8 +116,8 @@ public class RTTIUtil {
     //  Step 1: Find __cxxabiv1 typeinfo vtable addresses
     // ---------------------------------------------------------------
 
-    private void findCxxabiVtableAddresses() {
-        SymbolTable symTable = script.getCurrentProgram().getSymbolTable();
+    private void findCxxabiVtableAddresses(Program program) {
+        SymbolTable symTable = program.getSymbolTable();
 
         // Search internal symbols
         SymbolIterator iter = symTable.getAllSymbols(false);
@@ -133,7 +135,7 @@ public class RTTIUtil {
         }
 
         // Search external references
-        ReferenceManager refMan = script.getCurrentProgram().getReferenceManager();
+        ReferenceManager refMan = program.getReferenceManager();
         ReferenceIterator refIter = refMan.getExternalReferences();
         while (refIter.hasNext()) {
             Reference ref = refIter.next();
@@ -172,9 +174,9 @@ public class RTTIUtil {
     //  Step 2: Scan .rodata for typeinfo structs
     // ---------------------------------------------------------------
 
-    private void scanForTypeinfoStructs() throws Exception {
-        Memory mem = script.getCurrentProgram().getMemory();
-        MemoryBlock rodata = findRodataBlock();
+    private void scanForTypeinfoStructs(Program program) throws Exception {
+        Memory mem = program.getMemory();
+        MemoryBlock rodata = findRodataBlock(program);
         if (rodata == null) {
             script.printerr("Could not find .rodata block!");
             return;
@@ -198,7 +200,7 @@ public class RTTIUtil {
             // Also check if there's an external reference at this address
             // that resolves to one of the __cxxabiv1 vtables
             if (rttiType == null) {
-                rttiType = checkExternalRefForCxxabi(addr);
+                rttiType = checkExternalRefForCxxabi(program, addr);
                 if (rttiType != null) {
                     discoveredTypeinfos.put(off, rttiType);
                 }
@@ -209,8 +211,8 @@ public class RTTIUtil {
     /**
      * Check if an address has an external reference pointing to a __cxxabiv1 typeinfo vtable.
      */
-    private String checkExternalRefForCxxabi(Address addr) {
-        ReferenceManager refMgr = script.getCurrentProgram().getReferenceManager();
+    private String checkExternalRefForCxxabi(Program program, Address addr) {
+        ReferenceManager refMgr = program.getReferenceManager();
         for (Reference ref : refMgr.getReferencesFrom(addr)) {
             if (ref instanceof ExternalReference extRef) {
                 String label = extRef.getLabel();
@@ -221,8 +223,8 @@ public class RTTIUtil {
         return null;
     }
 
-    private MemoryBlock findRodataBlock() {
-        Memory mem = script.getCurrentProgram().getMemory();
+    private MemoryBlock findRodataBlock(Program program) {
+        Memory mem = program.getMemory();
         for (MemoryBlock block : mem.getBlocks()) {
             String name = block.getName();
             if (name.equals(".rodata") || name.equals("rodata")) {
@@ -242,10 +244,10 @@ public class RTTIUtil {
     //  Step 3: Demangle RTTI name strings
     // ---------------------------------------------------------------
 
-    private void demangleNames() throws Exception {
-        Memory mem = script.getCurrentProgram().getMemory();
-        AddressSpace space = script.getCurrentProgram().getAddressFactory().getDefaultAddressSpace();
-        SymbolTable symTable = script.getCurrentProgram().getSymbolTable();
+    private void demangleNames(Program program) throws Exception {
+        Memory mem = program.getMemory();
+        AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+        SymbolTable symTable = program.getSymbolTable();
 
         for (Map.Entry<Long, String> entry : discoveredTypeinfos.entrySet()) {
             long tiAddr = entry.getKey();
@@ -257,13 +259,15 @@ public class RTTIUtil {
             nameStringAddrs.add(namePtr);
 
             // Check if there's string data at the name address
-            Data data = script.getDataAt(nameAddr);
+            Listing listing = program.getListing();
+            Data data = listing.getDataAt(nameAddr);
             if (data == null || !(data.getValue() instanceof String)) {
                 // Try to create a string
                 try {
-                    script.clearListing(nameAddr);
-                    script.createAsciiString(nameAddr);
-                    data = script.getDataAt(nameAddr);
+                    listing.clearCodeUnits(nameAddr, nameAddr, true);
+                    CreateStringCmd cmd = new CreateStringCmd(nameAddr);
+                    cmd.applyTo(program);
+                    data = listing.getDataAt(nameAddr);
                 } catch (Exception e) {
                     script.println("    WARNING: Could not create string at 0x" +
                             Long.toHexString(namePtr));
@@ -271,16 +275,17 @@ public class RTTIUtil {
                 }
             }
 
+            SymbolTable symTab = program.getSymbolTable();
             if (data != null && data.getValue() instanceof String name) {
                 // Set symbol name with _ZTS prefix for demangling
                 String mangled = "_ZTS" + name;
-                Symbol sym = script.getSymbolAt(nameAddr);
-                if (sym == null) {
-                    sym = symTable.createLabel(nameAddr, mangled, SourceType.USER_DEFINED);
+                Symbol[] syms = symTab.getSymbols(nameAddr);
+                if (syms == null || syms.length == 0) {
+                    symTable.createLabel(nameAddr, mangled, SourceType.USER_DEFINED);
                 } else {
-                    sym.setName(mangled, SourceType.DEFAULT);
+                    syms[0].setName(mangled, SourceType.DEFAULT);
                 }
-                DemangleAndNameNamespace(script.getCurrentProgram(), nameAddr, script.getMonitor());
+                DemangleAndNameNamespace(program, nameAddr, script.getMonitor());
             }
         }
     }
@@ -289,9 +294,9 @@ public class RTTIUtil {
     //  Step 4: Ensure typeinfo data types exist
     // ---------------------------------------------------------------
 
-    private void ensureTypeInfoDataTypes() throws Exception {
-        DataTypeManager dtm = script.getCurrentProgram().getDataTypeManager();
-        int ptrSize = script.getCurrentProgram().getDefaultPointerSize();
+    private void ensureTypeInfoDataTypes(Program program) throws Exception {
+        DataTypeManager dtm = program.getDataTypeManager();
+        int ptrSize = program.getDefaultPointerSize();
 
         int txId = dtm.startTransaction("Create __cxxabiv1 typeinfo structs");
         try {
@@ -301,8 +306,8 @@ public class RTTIUtil {
 
             // Determine max base count needed
             Set<Integer> baseCounts = new HashSet<>();
-            Memory mem = script.getCurrentProgram().getMemory();
-            AddressSpace space = script.getCurrentProgram().getAddressFactory().getDefaultAddressSpace();
+            Memory mem = program.getMemory();
+            AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
             for (Map.Entry<Long, String> entry : discoveredTypeinfos.entrySet()) {
                 if (entry.getValue().equals("__vmi_class_type_info")) {
                     Address addr = space.getAddress(entry.getKey());
@@ -383,13 +388,13 @@ public class RTTIUtil {
     //  Step 5: Apply struct types to discovered typeinfos
     // ---------------------------------------------------------------
 
-    private void applyTypeinfoStructs() throws Exception {
-        Memory mem = script.getCurrentProgram().getMemory();
-        DataTypeManager dtm = script.getCurrentProgram().getDataTypeManager();
-        Listing listing = script.getCurrentProgram().getListing();
-        SymbolTable symTable = script.getCurrentProgram().getSymbolTable();
-        ReferenceManager refMgr = script.getCurrentProgram().getReferenceManager();
-        AddressSpace space = script.getCurrentProgram().getAddressFactory().getDefaultAddressSpace();
+    private void applyTypeinfoStructs(Program program) throws Exception {
+        Memory mem = program.getMemory();
+        DataTypeManager dtm = program.getDataTypeManager();
+        Listing listing = program.getListing();
+        SymbolTable symTable = program.getSymbolTable();
+        ReferenceManager refMgr = program.getReferenceManager();
+        AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
 
         for (Map.Entry<Long, String> entry : discoveredTypeinfos.entrySet()) {
             long tiAddrOff = entry.getKey();
@@ -469,8 +474,8 @@ public class RTTIUtil {
                     }
                 }
                 if (!found) {
-                    script.createLabel(addr, "typeinfo", parentNs, true,
-                            SourceType.USER_DEFINED);
+                    program.getSymbolTable().createLabel(addr, "typeinfo",
+                            parentNs, SourceType.USER_DEFINED);
                 }
 //                script.println("    " + parentNs.getName(true) + "::typeinfo at 0x" +
 //                        Long.toHexString(tiAddrOff));
@@ -482,9 +487,9 @@ public class RTTIUtil {
     //  Step 6: Discover vtables
     // ---------------------------------------------------------------
 
-    private void discoverVtables() throws Exception {
-        Memory mem = script.getCurrentProgram().getMemory();
-        MemoryBlock rodata = findRodataBlock();
+    private void discoverVtables(Program program) throws Exception {
+        Memory mem = program.getMemory();
+        MemoryBlock rodata = findRodataBlock(program);
         if (rodata == null) {
             script.printerr("Could not find .rodata block!");
             return;
