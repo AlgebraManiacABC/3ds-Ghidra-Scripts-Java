@@ -52,8 +52,11 @@ public class ExportSymbols extends GhidraScript {
 
         boolean directory = askYesNo("Export in directory?","Should symbols from an entire directory be exported? (Otherwise, will operate on this program)");
         boolean unique = askYesNo("Create unique symbols?","Should the script export each symbol with a unique name (including the symbol address)?");
+        boolean merge = false;
+        if (directory)
+            merge = askYesNo("Merge symbols?","Would you like to merge all symbols into a single file?");
 
-        if (directory) {
+        if (directory && !merge) {
             DomainFolder folder = askProjectFolder("Select Directory to Symbolify");
             File outDir = askDirectory("Output directory", "OK");
 
@@ -75,6 +78,23 @@ public class ExportSymbols extends GhidraScript {
                 out.close();
             }
 
+        } else if (merge) {
+            DomainFolder folder = askProjectFolder("Select Directory to Symbolify");
+            File outFile = askFile("Output file", "OK");
+            PrintWriter out = new PrintWriter(new FileWriter(outFile));
+            out.println("Module,Location,Name,Mode,Size,Segment");
+            List<DomainFile> files_to_symbolify = getAllFilesInDirectory(folder);
+            ProgramManager pman = getState().getTool().getService(ProgramManager.class);
+            Map<String, List<SymbolData>> symbols = new HashMap<>();
+            files_to_symbolify.forEach(f -> {
+                Program p = pman.openCachedProgram(f, this);
+                symbols.put(p.getName(),extractSymbols(p, unique));
+                if (p != currentProgram) pman.closeProgram(p, true);
+            });
+            symbols.forEach((s,sdList) -> sdList.forEach(sd ->
+                    out.printf("\"%s\",%s\n",s,sd.toString())
+            ));
+            out.close();
         } else {
             File outFile = askFile("Output file", "OK");
             PrintWriter out = new PrintWriter(new FileWriter(outFile));
@@ -141,9 +161,9 @@ public class ExportSymbols extends GhidraScript {
                         if (segment != null) {
                             segName = segment.getName();
                         } else {
-                            printf("No block at address %s - The output of" +
-                                    "this address will likely be incorrect, as it was set" +
-                                    "to .text by default!\n", addr);
+                            printf("No block at address %s - The output of " +
+                                    "this symbol (%s) will likely be incorrect, as it was set " +
+                                    "to .text by default!\n", addr, symbol.getName());
                         }
                         symbolCounts.computeIfAbsent(ranged_name, k -> new ArrayList<>())
                                 .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size, segName));
@@ -162,9 +182,9 @@ public class ExportSymbols extends GhidraScript {
             if (segment != null) {
                 segName = segment.getName();
             } else {
-                printf("No block at address %s - The output of" +
-                        "this address will likely be incorrect, as it was set" +
-                        "to .text by default!\n", addr);
+                printf("No block at address %s - The output of " +
+                        "this symbol (%s) will likely be incorrect, as it was set " +
+                        "to .text by default!\n", addr, symbol.getName());
             }
             symbolCounts.computeIfAbsent(name, k -> new ArrayList<>())
                     .add(new SymbolData(addr, name, mode, size, segName));
@@ -183,6 +203,7 @@ public class ExportSymbols extends GhidraScript {
                 }
             }
         }
+        symbols.sort(SymbolData::compareTo);
         return symbols;
     }
 
