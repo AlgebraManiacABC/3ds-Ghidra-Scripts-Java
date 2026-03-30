@@ -507,7 +507,7 @@ public class RenameVTableFunctions extends GhidraScript {
         List<EntryType> entryClasses = new ArrayList<>();
 
         Address current = startAddr;
-        while (current.getOffset() <= endAddr.getOffset() - PTR_SIZE) {
+        while (current.getOffset() <= endAddr.getOffset()) {
             long value = Integer.toUnsignedLong(mem.getInt(current));
             EntryType cls = classifyEntry(value);
             if (cls == EntryType.FUNC_PTR || cls == EntryType.TYPEINFO_PTR) {
@@ -516,7 +516,9 @@ public class RenameVTableFunctions extends GhidraScript {
             } else {
                 Data curdata = getDataAt(current);
                 if (curdata == null) {
-                    createData(current, Undefined4DataType.dataType);
+                    try {
+                        createData(current, Undefined4DataType.dataType);
+                    } catch (Exception e) {}
                 }
             }
 
