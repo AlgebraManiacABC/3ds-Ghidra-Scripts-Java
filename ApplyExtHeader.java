@@ -63,7 +63,9 @@ public class ApplyExtHeader extends GhidraScript {
             }
         }
 
-        currentProgram.setImageBase(toAddr(0x100000), true);
+        // Move to correct start location
+        MemoryBlock onlyBlock = memory.getBlock(currentProgram.getMinAddress());
+        memory.moveBlock(onlyBlock, toAddr(0x100000), monitor);
 
         // Split according to segment info
         for (SegmentBlock seg : Arrays.stream(segments)
