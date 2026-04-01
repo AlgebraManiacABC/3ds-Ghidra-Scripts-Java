@@ -1084,6 +1084,8 @@ public class RenameVTableFunctions {
         for (int i = 0; i < mySlots.size(); i++) {
             long funcPtr = mySlots.get(i);
             Address slotAddr = start.add(4L * i);
+            if (isPureVirtualRef(slotAddr)) { pureVirtualCount++; continue; }
+            if (funcPtr == 0) { skipCount++; continue; }
             boolean isExternal = false;
             for (Reference r : program.getReferenceManager().getReferencesFrom(slotAddr)) {
                 if (r instanceof ExternalReference) { isExternal = true; break; }
