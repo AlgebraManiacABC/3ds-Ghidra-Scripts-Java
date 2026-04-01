@@ -22,12 +22,14 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 
+import java.math.BigInteger;
 import java.util.*;
 
 public class RenameVTableFunctions {
@@ -86,29 +88,54 @@ public class RenameVTableFunctions {
      */
     public void run(Program prog, Map<Long, Long> vtableRttiSlots, Set<Long> knownTypeinfos)
             throws Exception {
+        // Clear state from any previous run
+        typeinfoToClassName.clear();
+        parentMap.clear();
+        childrenMap.clear();
+        allVtableSlots.clear();
+        vtableSlots.clear();
+        allVtableAddressPoints.clear();
+        vtableAddressPoints.clear();
+        classNamespaces.clear();
+        typeinfoAddresses.clear();
+        processed.clear();
+        importedPrograms.clear();
+        pureVirtualAddr = 0;
+        externalPureVirtual = false;
+        renameCount = 0;
+        skipCount = 0;
+        pureVirtualCount = 0;
+
         program = prog;
         symTab = prog.getSymbolTable();
         mem = prog.getMemory();
         typeinfoAddresses.addAll(knownTypeinfos);
 
+        script.printf("=== RTTI Renaming Pipeline for %s ===\n",program.getName());
+
         // Step 1: Find __cxa_pure_virtual
         findPureVirtual();
 
         // Step 2: Build inheritance tree from typeinfo symbols
-        script.println("Building inheritance tree from typeinfo...");
         buildInheritanceTree();
-        script.println("  Classes found: " + typeinfoToClassName.size());
+        script.printf("    Classes found: %d ", typeinfoToClassName.size());
 
         // Step 3: Parse vtable slots from discovered RTTI slot locations
-        script.println("Parsing vtable slots...");
         parseVtableSlots(vtableRttiSlots);
-        script.println("  Classes with vtable data: " + vtableSlots.size());
+        script.printf("(%d with vtable data)\n", vtableSlots.size());
+
+        // Step 3.5: If __cxa_pure_virtual wasn't found by symbol, detect by vtable analysis
+        if (pureVirtualAddr == 0 && !externalPureVirtual) {
+            detectPureVirtual();
+        }
+        if (pureVirtualAddr == 0 && !externalPureVirtual) {
+            script.printf("    WARNING: No __cxa_pure_virtual for %s\n",program.getName());
+        }
 
         // Step 4: Collect namespace objects
         collectNamespaces();
 
         // Step 5: Process in topological order (Kahn's algorithm)
-        script.println("Processing classes in topological order...");
 
         Map<String, Integer> inDegree = new HashMap<>();
         for (String className : typeinfoToClassName.values()) {
@@ -124,9 +151,6 @@ public class RenameVTableFunctions {
                 queue.add(entry.getKey());
             }
         }
-        script.println("  Root classes: " + queue.size());
-        script.println("");
-        script.println("=== RENAMING FUNCTIONS ===\n");
 
         while (!queue.isEmpty()) {
             String className = queue.poll();
@@ -145,9 +169,7 @@ public class RenameVTableFunctions {
         }
 
         // Step 6: Propagate discovered names upward through the hierarchy
-        script.println("\n=== PROPAGATING NAMES UPWARD ===\n");
-        int propagated = propagateNames();
-        script.println("Names propagated:       " + propagated);
+        propagateNames();
 
         // Report unreached classes
         int unreached = 0;
@@ -155,7 +177,7 @@ public class RenameVTableFunctions {
             if (!processed.contains(className)) {
                 unreached++;
                 if (unreached <= 20) {
-                    script.println("UNREACHED: " + className +
+                    script.println("    UNREACHED: " + className +
                             " (parent: " + parentMap.getOrDefault(className, List.of()) + ")");
                 }
             }
@@ -164,11 +186,11 @@ public class RenameVTableFunctions {
             script.println("... and " + (unreached - 20) + " more unreached classes.");
         }
 
-        script.println("\n=== SUMMARY ===");
-        script.println("Functions renamed:      " + renameCount);
-        script.println("Slots skipped (same):   " + skipCount);
-        script.println("Pure virtual skipped:   " + pureVirtualCount);
-        script.println("Unreached classes:      " + unreached);
+        script.println("    Functions renamed:      " + renameCount);
+        script.println("    Slots skipped (same):   " + skipCount);
+        script.println("    Pure virtual skipped:   " + pureVirtualCount);
+        script.println("    Unreached classes:      " + unreached);
+        script.println("=========================================================");
 
         // Release CRO programs
         for (Program p : importedPrograms.values()) {
@@ -186,7 +208,7 @@ public class RenameVTableFunctions {
         SymbolIterator iter = program.getSymbolTable().getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol sym = iter.next();
-            if (sym.getName().equals("__cxa_pure_virtual")) {
+            if (sym.getName().contains("__cxa_pure_virtual")) {
                 pureVirtualAddr = sym.getAddress().getOffset();
                 script.println("Found __cxa_pure_virtual at 0x" +
                         Long.toHexString(pureVirtualAddr));
@@ -209,9 +231,6 @@ public class RenameVTableFunctions {
                 }
             }
         }
-
-        script.println("WARNING: __cxa_pure_virtual not found. " +
-                "Pure virtual slots will not be detected.");
     }
 
     private boolean isPureVirtualRef(Address addr) throws MemoryAccessException {
@@ -227,8 +246,7 @@ public class RenameVTableFunctions {
             }
             return false;
         }
-        long funcPtr = script.toAddr(addr.getOffset()).getOffset();
-        funcPtr = Integer.toUnsignedLong(program.getMemory().getInt(addr));
+        long funcPtr = Integer.toUnsignedLong(program.getMemory().getInt(addr));
         return (funcPtr & ~1L) == (pureVirtualAddr & ~1L);
     }
 
@@ -263,6 +281,10 @@ public class RenameVTableFunctions {
 
             long addr = sym.getAddress().getOffset();
             String className = ns.getName(true);
+
+            // Skip __cxxabiv1 infrastructure classes
+            if (className.startsWith("__cxxabiv1")) continue;
+
             if (ns instanceof Library) {
                 if (!sym.hasReferences()) continue;
             }
@@ -297,24 +319,25 @@ public class RenameVTableFunctions {
             else if (className.contains("class_type")) rttiType = "__class_type_info";
         }
         if (rttiType == null) {
-            script.println("WARNING: Could not determine RTTI type for " +
+            script.println("    WARNING: Could not determine RTTI type for " +
                     className + " at " + addr + " in " + program.getName());
             return;
         }
 
         switch (rttiType) {
             case "__class_type_info" -> {}
-            case "__si_class_type_info" -> resolveBaseType(addr.add(8), className);
+            case "__si_class_type_info" -> resolveBaseType(program, addr.add(8), className);
             case "__vmi_class_type_info" -> {
                 int baseCount = progMem.getInt(addr.add(12));
                 for (int b = 0; b < baseCount; b++) {
-                    resolveBaseType(addr.add(16 + b * 8L), className);
+                    resolveBaseType(program, addr.add(16 + b * 8L), className);
                 }
             }
         }
     }
 
-    private void resolveBaseType(Address baseFieldAddr,
+    private void resolveBaseType(Program program,
+                                 Address baseFieldAddr,
                                  String childClassName) throws Exception {
         Memory progMem = program.getMemory();
         long basePtr = Integer.toUnsignedLong(progMem.getInt(baseFieldAddr));
@@ -336,13 +359,13 @@ public class RenameVTableFunctions {
                 addParentChild(childClassName, result.className);
                 resolveParents(result.program, result.typeinfoAddr, result.className);
             } else {
-                script.println("WARNING: Could not resolve external parent for " +
+                script.println("    WARNING: Could not resolve external parent for " +
                         childClassName + " at " + baseFieldAddr);
             }
             return;
         }
 
-        script.println("WARNING: Unknown base typeinfo pointer 0x" +
+        script.println("    WARNING: Unknown base typeinfo pointer 0x" +
                 Long.toHexString(basePtr) + " for " + childClassName);
     }
 
@@ -378,7 +401,7 @@ public class RenameVTableFunctions {
             ProjectData projectData = script.getState().getProject().getProjectData();
             DomainFile domainFile = projectData.getFile(progPath);
             if (domainFile == null) {
-                script.println("WARNING: Could not find CRO program: " + progPath);
+                script.println("    WARNING: Could not find CRO program: " + progPath);
                 importedPrograms.put(progPath, null);
                 return null;
             }
@@ -386,11 +409,9 @@ public class RenameVTableFunctions {
                     script, true, false, script.getMonitor());
             importedPrograms.put(progPath, prog);
             collectTypeinfoSymbols(prog);
-            script.println("Opened CRO: " + progPath +
-                    " (" + typeinfoToClassName.size() + " total typeinfo)");
             return prog;
         } catch (Exception e) {
-            script.println("ERROR: Could not open CRO program " +
+            script.println("    ERROR: Could not open CRO program " +
                     progPath + ": " + e.getMessage());
             importedPrograms.put(progPath, null);
             return null;
@@ -646,28 +667,21 @@ public class RenameVTableFunctions {
                 Address currentAddr = addressSpace.getAddress(current);
                 long value = Integer.toUnsignedLong(program.getMemory().getInt(currentAddr));
 
-                if (isFunctionPointer(currentAddr, value)) {
-                    if (addressPoint == null) {
-                        addressPoint = currentAddr;
-                    }
-                    slots.add(value);
+                if (!isFunctionPointer(currentAddr, value)) break;
 
-                    // Apply pointer data type
-                    try {
-
-                        if (listing.getDataAt(currentAddr) != null) {
-                            listing.clearCodeUnits(currentAddr,currentAddr,true);
-                        }
-                        listing.createData(currentAddr, PointerDataType.dataType);
-                    } catch (Exception e) { /* already applied */ }
-                } else if (isPureVirtualRef(currentAddr)) {
-                    if (addressPoint == null) {
-                        addressPoint = currentAddr;
-                    }
-                    slots.add(value);
-                } else {
-                    break;
+                if (addressPoint == null) {
+                    addressPoint = currentAddr;
                 }
+                slots.add(value);
+
+                // Apply pointer data type
+                try {
+
+                    if (listing.getDataAt(currentAddr) != null) {
+                        listing.clearCodeUnits(currentAddr, currentAddr, true);
+                    }
+                    listing.createData(currentAddr, PointerDataType.dataType);
+                } catch (Exception e) { /* already applied */ }
 
                 current += PTR_SIZE;
             }
@@ -684,6 +698,126 @@ public class RenameVTableFunctions {
                 }
             }
         }
+    }
+
+    /**
+     * Detect __cxa_pure_virtual by finding a function pointer that appears
+     * in vtable slots of two classes that share no inheritance relationship.
+     */
+    private void detectPureVirtual() {
+        // Pass 1: group non-zero slot values by class
+        Map<Long, Set<String>> valuesToClasses = new HashMap<>();
+        for (Map.Entry<String, List<List<Long>>> entry : allVtableSlots.entrySet()) {
+            String className = entry.getKey();
+            for (List<Long> subVtable : entry.getValue()) {
+                for (long val : subVtable) {
+                    if (val == 0) continue;
+                    valuesToClasses.computeIfAbsent(val, k -> new HashSet<>())
+                            .add(className);
+                }
+            }
+        }
+
+        List<Long> candidates = new ArrayList<>();
+        for (Map.Entry<Long, Set<String>> entry : valuesToClasses.entrySet()) {
+            if (entry.getValue().size() < 2) continue;
+            if ((entry.getKey() & 1L) == 0) continue;
+            if (hasUnrelatedPair(entry.getValue())) {
+                candidates.add(entry.getKey());
+            }
+        }
+
+        if (!candidates.isEmpty()) {
+            candidates.sort(Comparator.comparingInt(k -> valuesToClasses.get(k).size()).reversed());
+            pureVirtualAddr = candidates.getFirst() & ~1L;
+            script.println("    Detected __cxa_pure_virtual at 0x" +
+                    Long.toHexString(pureVirtualAddr) +
+                    " (thumb function which appears in unrelated vtables)");
+            AddressSpace addrSpace = program.getMinAddress().getAddressSpace();
+            CreateFunctionCmd cmd = new CreateFunctionCmd("__cxa_pure_virtual",
+                    addrSpace.getAddress(pureVirtualAddr),null,SourceType.USER_DEFINED);
+            cmd.applyTo(program);
+            if (candidates.size() > 1) {
+                script.println("    WARNING: " + candidates.size() +
+                        " candidates found for __cxa_pure_virtual:");
+                for (long addr : candidates) {
+                    script.println("  0x" + Long.toHexString(addr) +
+                            " (" + valuesToClasses.get(addr).size() + " classes)");
+                }
+            }
+            return;
+        }
+
+        // Pass 2: group zero-valued slots (external refs) by target
+        Map<ExternalLocation, Set<String>> extKeyToClasses = new HashMap<>();
+        ReferenceManager refMgr = program.getReferenceManager();
+        for (Map.Entry<String, List<List<Long>>> entry : allVtableSlots.entrySet()) {
+            String className = entry.getKey();
+            List<List<Long>> subVtables = entry.getValue();
+            List<Address> addrPoints = allVtableAddressPoints.get(className);
+            if (addrPoints == null) continue;
+
+            for (int s = 0; s < subVtables.size(); s++) {
+                if (s >= addrPoints.size() || addrPoints.get(s) == null) continue;
+                Address base = addrPoints.get(s);
+                List<Long> slots = subVtables.get(s);
+                for (int i = 0; i < slots.size(); i++) {
+                    if (slots.get(i) != 0) continue;
+                    Address slotAddr = base.add(4L * i);
+                    for (Reference ref : refMgr.getReferencesFrom(slotAddr)) {
+                        if (ref instanceof ExternalReference extRef) {
+                            ExternalLocation loc = extRef.getExternalLocation();
+                            extKeyToClasses.computeIfAbsent(loc, k -> new HashSet<>())
+                                    .add(className);
+                        }
+                    }
+                }
+            }
+        }
+
+        List<ExternalLocation> extCandidates = new ArrayList<>();
+        for (Map.Entry<ExternalLocation, Set<String>> entry : extKeyToClasses.entrySet()) {
+            if (entry.getValue().size() < 2) continue;
+            if (!entry.getKey().isFunction()) continue;
+            Function f = entry.getKey().getFunction();
+            Register tModeReg = program.getLanguage().getRegister("TMode");
+            BigInteger tMode = program.getProgramContext().getValue(tModeReg, f.getEntryPoint(), false);
+            boolean isThumb = tMode != null && tMode.intValue() == 1;
+            if (!isThumb) continue;
+            if (hasUnrelatedPair(entry.getValue())) {
+                extCandidates.add(entry.getKey());
+            }
+        }
+
+        if (extCandidates.isEmpty()) {
+            return;
+        }
+
+        ExternalLocation loc = extCandidates.getFirst();
+        externalPureVirtual = true;
+        pureVirtualAddr = loc.getAddress() != null ? loc.getAddress().getOffset() : 0;
+        script.println("    Detected external __cxa_pure_virtual: " + loc +
+                " (thumb function which appears in unrelated vtables)");
+
+        if (extCandidates.size() > 1) {
+            script.println("    WARNING: " + extCandidates.size() +
+                    " external candidates found for __cxa_pure_virtual:");
+            extCandidates.sort(Comparator.comparingInt(key -> extKeyToClasses.get(key).size()));
+            extCandidates.forEach(key -> script.println("  " + key +
+                    " (" + extKeyToClasses.get(key).size() + " classes)"));
+        }
+    }
+
+    private boolean hasUnrelatedPair(Set<String> classes) {
+        List<String> list = new ArrayList<>(classes);
+        for (int i = 0; i < list.size() - 1; i++) {
+            for (int j = i + 1; j < list.size(); j++) {
+                if (findCommonAncestor(list.get(i), list.get(j)) == null) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -973,7 +1107,9 @@ public class RenameVTableFunctions {
                 String common = findCommonAncestor(existingClassName, className);
                 if (common != null) {
                     Namespace commonNs = classNamespaces.get(common);
-                    if (commonNs == null) {
+                    if (commonNs == null && NamespaceUtils.getNamespacesByName(
+                            program, program.getGlobalNamespace(), common)
+                            .isEmpty()) {
                         try {
                             commonNs = createNamespace(program,
                                     program.getGlobalNamespace(), common);

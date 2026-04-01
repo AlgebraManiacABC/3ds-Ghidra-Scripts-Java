@@ -55,6 +55,11 @@ public class CRXLibrary {
         return 0x304F5243 == getInt(crxBytes, 0x80);
     }
 
+    public Address getBaseAddr() {
+        if (program == null || segments == null) return null;
+        return segments[0].getStart();
+    }
+
     public CRXLibrary(DomainFile codeFile, File crsFile,
                ProgramManager pman, TaskMonitor monitor) throws Exception {
         crxBytes = ThreeDSUtils.getAllBytes(crsFile);
@@ -112,8 +117,11 @@ public class CRXLibrary {
             throw new TimeoutException(error);
         }
         program.clearUndo();
-        if (save)
+        if (save) {
             program.save("CROLink save", monitor);
+        } else {
+            program.setTemporary(true);
+        }
         program.release(this);
     }
 
@@ -140,7 +148,7 @@ public class CRXLibrary {
                 Address addr = mangled.getAddress();
                 List<DemangledObject> objs = DemanglerUtil.demangle(program, mangled.getName(), addr);
                 for (var obj : objs) {
-                    boolean applied = false;
+                    boolean applied;
                     try {
                         applied = obj.applyTo(
                                 program, addr, new DemanglerOptions(), monitor);
@@ -227,7 +235,7 @@ public class CRXLibrary {
         if (segOff.getIndex() == SegmentOffset.ID.TEXT) {
             return applyFunctionNameHere(name, addr);
         } else {
-            Symbol check = null;
+            Symbol check;
             int tx_id = program.startTransaction("Naming address");
             try {
                 check = ThreeDSUtils.labelNamedData(name, addr, program);

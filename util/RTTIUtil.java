@@ -12,6 +12,8 @@ package util;
 
 import ghidra.app.cmd.data.CreateStringCmd;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.services.ProgramManager;
+import ghidra.framework.model.DomainFile;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.*;
@@ -22,6 +24,7 @@ import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 import static util.Demangler.DemangleAndNameNamespace;
@@ -35,7 +38,7 @@ public class RTTIUtil {
 
     // __cxxabiv1 typeinfo vtable addresses -> base RTTI type name
     // e.g. 0x12345678 -> "__class_type_info"
-    private final Map<Long, String> cxxabiVtableAddrs = new LinkedHashMap<>();
+    private final Map<String, Map<Address, String>> cxxabiVtableAddrs = new LinkedHashMap<>();
 
     // Discovered typeinfo struct locations -> base RTTI type name
     private final Map<Long, String> discoveredTypeinfos = new LinkedHashMap<>();
@@ -63,38 +66,38 @@ public class RTTIUtil {
      * create/apply struct types, discover vtables.
      */
     public void run(Program program) throws Exception {
-        script.println("=== RTTI Discovery Pipeline ===\n");
+        // Clear per-module state (but keep cxxabiVtableAddrs across runs)
+        discoveredTypeinfos.clear();
+        typeinfoStructSizes.clear();
+        vtableRttiSlots.clear();
+        nameStringAddrs.clear();
+        script.printf("=== RTTI Discovery Pipeline for %s ===\n",program.getName());
 
-        script.println("[1] Finding __cxxabiv1 typeinfo vtable addresses...");
         findCxxabiVtableAddresses(program);
-        script.println("    Found " + cxxabiVtableAddrs.size() + " vtable address(es).\n");
 
         if (cxxabiVtableAddrs.isEmpty()) {
             script.printerr("No __cxxabiv1 typeinfo vtable addresses found. Cannot proceed.");
             return;
         }
 
-        script.println("[2] Scanning .rodata for typeinfo structs...");
         scanForTypeinfoStructs(program);
-        script.println("    Found " + discoveredTypeinfos.size() + " typeinfo struct(s).\n");
 
-        script.println("[3] Demangling RTTI name strings...");
         demangleNames(program);
-        script.println("    Processed " + nameStringAddrs.size() + " name string(s).\n");
 
-        script.println("[4] Ensuring typeinfo data types exist...");
         ensureTypeInfoDataTypes(program);
-        script.println("    Done.\n");
 
-        script.println("[5] Applying struct types to discovered typeinfos...");
         applyTypeinfoStructs(program);
-        script.println("    Done.\n");
 
-        script.println("[6] Discovering vtables in .rodata...");
         discoverVtables(program);
-        script.println("    Found " + vtableRttiSlots.size() + " vtable(s).\n");
 
-        script.println("=== RTTI Discovery Complete ===");
+        script.println("    Local vtable addresses: " +
+                cxxabiVtableAddrs.get(program.getName()).size());
+        script.println("    Typeinfo structs:       " +
+                discoveredTypeinfos.size());
+        script.println("    Typeinfo strings:       " +
+                nameStringAddrs.size());
+        script.println("    Vtables:                " +
+                vtableRttiSlots.size());
     }
 
     /** Returns the map of vtable RTTI slot address -> typeinfo address. */
@@ -116,7 +119,96 @@ public class RTTIUtil {
     //  Step 1: Find __cxxabiv1 typeinfo vtable addresses
     // ---------------------------------------------------------------
 
+    // Known mangled names for the __cxxabiv1 typeinfo classes
+    private static final Map<String, String> CXXABI_MANGLED_NAMES = Map.of(
+            "N10__cxxabiv117__class_type_infoE", "__class_type_info",
+            "N10__cxxabiv120__si_class_type_infoE", "__si_class_type_info",
+            "N10__cxxabiv121__vmi_class_type_infoE", "__vmi_class_type_info"
+    );
+
+    private Map<Address, String> scanForTypeInfoRefs(Program program) throws Exception {
+        Map<Address, String> refs = new HashMap<>();
+        Memory mem = program.getMemory();
+        MemoryBlock rodata = findRodataBlock(program);
+        if (rodata == null) {
+            script.printerr("Could not find .rodata block!");
+            return null;
+        }
+        Address startOff = rodata.getStart();
+        Address endOff = rodata.getEnd();
+
+        // First pass: find all typeinfo string bases
+        Map<Address, String> typeInfoNameAddrs = new HashMap<>();
+        for (var entry : CXXABI_MANGLED_NAMES.entrySet()) {
+            byte[] pattern = entry.getKey().getBytes(StandardCharsets.US_ASCII);
+            Address addr = mem.getMinAddress();
+            while (addr != null) {
+                addr = mem.findBytes(addr, pattern, null, true, script.getMonitor());
+                if (addr == null) break;
+                typeInfoNameAddrs.put(addr, entry.getValue());
+                addr = addr.add(1);
+            }
+        }
+
+        // Second pass: find references, excluding hits inside the cxxabi typeinfo structs themselves
+        Map<Address, String> typeinfoStructAddrs = new HashMap<>();
+        for (var base : typeInfoNameAddrs.entrySet()) {
+            long namePtr = base.getKey().getOffset();
+            for (Address off = startOff; off.add(PTR_SIZE).compareTo(endOff) <= 0; off = off.add(PTR_SIZE)) {
+                long here = mem.getInt(off);
+                if (here != namePtr) continue;
+                // Otherwise, this is a reference to the typeinfo-name.
+                typeinfoStructAddrs.put(off.subtract(4), base.getValue());
+            }
+        }
+
+        // Final pass: get references to the typeinfo structs, excluding inside the cxxabi structs
+        SymbolTable symTab = program.getSymbolTable();
+        for (Map.Entry<Address,String> entry : typeinfoStructAddrs.entrySet()) {
+            long tiPtr = entry.getKey().getOffset();
+            for (Address off = startOff; off.add(PTR_SIZE).compareTo(endOff) <= 0; off = off.add(PTR_SIZE)) {
+                long here = mem.getInt(off);
+                if (here != tiPtr) continue;
+                // Otherwise, this is a reference to the typeinfo struct!
+                if (!isInsideTypeInfoBase(off, typeinfoStructAddrs)) {
+                    refs.put(off, entry.getValue());
+                    refs.put(off.add(4), entry.getValue());
+                    // Label the head and first ptr
+                    symTab.createLabel(off.add(4),entry.getValue() + "_vtable", SourceType.USER_DEFINED);
+                    symTab.createLabel(off.subtract(4),entry.getValue() + "::vtable", SourceType.USER_DEFINED);
+                }
+            }
+        }
+
+        return refs;
+    }
+
+    private boolean isInsideTypeInfoBase(Address addr, Map<Address, String> bases) {
+        for (Address base : bases.keySet()) {
+            long diff = addr.subtract(base);
+            if (Math.abs(diff) < 12) return true;
+        }
+        return false;
+    }
+
     private void findCxxabiVtableAddresses(Program program) {
+        // Bootstrap from name strings first
+        try {
+            var map = scanForTypeInfoRefs(program);
+            if (map == null) throw new NullPointerException();
+            cxxabiVtableAddrs.computeIfAbsent(program.getName(),
+                    s -> new HashMap<>()).putAll(map);
+//            script.println("    === cxxabiVtableAddrs contents ===");
+//            for (Map.Entry<String, Map<Address, String>> entry : cxxabiVtableAddrs.entrySet()) {
+//                if (entry.getValue().isEmpty()) continue;
+//                script.printf("    %s:\n", entry.getKey());
+//                for (Map.Entry<Address, String> subentry : entry.getValue().entrySet()) {
+//                    script.printf("        %s : %s\n", subentry.getKey(), subentry.getValue());
+//                }
+//            }
+        } catch (Exception e) {
+            script.println("    WARNING: Bootstrap from name strings failed: " + e.getMessage());
+        }
         SymbolTable symTable = program.getSymbolTable();
 
         // Search internal symbols
@@ -125,11 +217,12 @@ public class RTTIUtil {
             Symbol sym = iter.next();
             String rttiType = classifySymbolName(sym.getName());
             if (rttiType != null) {
-                long addr = sym.getAddress().getOffset();
-                if (!cxxabiVtableAddrs.containsKey(addr)) {
-                    cxxabiVtableAddrs.put(addr, rttiType);
+                Address addr = sym.getAddress();
+                if (!cxxabiVtableAddrs.computeIfAbsent(program.getName(),
+                        s -> new HashMap<>()).containsKey(addr)) {
+                    cxxabiVtableAddrs.get(program.getName()).put(addr, rttiType);
                     script.println("    Internal: " + sym.getName() +
-                            " at 0x" + Long.toHexString(addr) + " -> " + rttiType);
+                            " at 0x" + addr + " -> " + rttiType);
                 }
             }
         }
@@ -140,18 +233,30 @@ public class RTTIUtil {
         while (refIter.hasNext()) {
             Reference ref = refIter.next();
             if (ref instanceof ExternalReference extRef) {
-                String rttiType = classifySymbolName(extRef.getLabel());
-                if (rttiType != null) {
-                    Address extAddr = extRef.getExternalLocation().getAddress();
-                    if (extAddr != null) {
-                        long addr = extAddr.getOffset();
-                        if (!cxxabiVtableAddrs.containsKey(addr)) {
-                            cxxabiVtableAddrs.put(addr, rttiType);
-                            script.println("    External: " + extRef.getLabel() +
-                                    " at 0x" + Long.toHexString(addr) + " -> " + rttiType);
-                        }
+                ExternalManager extMan = program.getExternalManager();
+                String extPath = extMan.getExternalLibraryPath(extRef.getLibraryName());
+                DomainFile extFile = script.parseDomainFile(extPath);
+                ProgramManager pman = script.getState().getTool().getService(ProgramManager.class);
+                Program extProg = pman.openCachedProgram(extFile, this);
+                Address extAddr = extRef.getExternalLocation().getAddress();
+                Symbol[] syms = extProg.getSymbolTable().getSymbols(extAddr);
+                for (Symbol sym : syms) {
+                    String extName = sym.getName();
+//                    script.printf("Found %s at %s in %s ",extName,extAddr,extProg.getName());
+                    String rttiType = classifySymbolName(extName);
+                    if (rttiType == null) {
+//                        script.printf("(not RTTI)\n");
+                        continue;
+                    }
+//                    script.printf("- FOUND RTTI!\n");
+                    if (!cxxabiVtableAddrs.computeIfAbsent(extProg.getName(),
+                            s -> new HashMap<>()).containsKey(extAddr)) {
+                        cxxabiVtableAddrs.get(extProg.getName()).put(extAddr, rttiType);
+                        script.println("    External: " + extName +
+                                " at 0x" + extAddr + " -> " + rttiType);
                     }
                 }
+                extProg.release(this);
             }
         }
     }
@@ -167,6 +272,7 @@ public class RTTIUtil {
         if (name.contains("__vmi_class_type_info")) return "__vmi_class_type_info";
         if (name.contains("__si_class_type_info")) return "__si_class_type_info";
         if (name.contains("__class_type_info")) return "__class_type_info";
+
         return null;
     }
 
@@ -181,18 +287,20 @@ public class RTTIUtil {
             script.printerr("Could not find .rodata block!");
             return;
         }
-
         Address start = rodata.getStart();
         Address end = rodata.getEnd();
         long startOff = start.getOffset();
         long endOff = end.getOffset();
 
+        AddressSpace addressSpace = program.getAddressFactory().getDefaultAddressSpace();
         // Scan every 4-byte-aligned address for values matching __cxxabiv1 vtable addresses
         for (long off = startOff; off + PTR_SIZE <= endOff + 1; off += PTR_SIZE) {
             Address addr = start.getNewAddress(off);
-            long value = Integer.toUnsignedLong(mem.getInt(addr));
 
-            String rttiType = cxxabiVtableAddrs.get(value);
+            long value = Integer.toUnsignedLong(mem.getInt(addr));
+            Address toCheck = addressSpace.getAddress(value);
+            String rttiType = cxxabiVtableAddrs.computeIfAbsent(program.getName(),
+                    s -> new HashMap<>()).get(toCheck);
             if (rttiType != null) {
                 discoveredTypeinfos.put(off, rttiType);
             }
@@ -215,9 +323,20 @@ public class RTTIUtil {
         ReferenceManager refMgr = program.getReferenceManager();
         for (Reference ref : refMgr.getReferencesFrom(addr)) {
             if (ref instanceof ExternalReference extRef) {
+                // Check label name
                 String label = extRef.getLabel();
                 String rttiType = classifySymbolName(label);
                 if (rttiType != null) return rttiType;
+
+                // Check if target address matches a known __cxxabiv1 vtable address
+                Address extAddr = extRef.getExternalLocation().getAddress();
+                String extName = extRef.getLibraryName();
+                if (extName.equals("|static|")) extName = script.getCurrentProgram().getName();
+                if (extAddr != null) {
+                    rttiType = cxxabiVtableAddrs.computeIfAbsent(extName,
+                            s -> new HashMap<>()).get(extAddr);
+                    if (rttiType != null) return rttiType;
+                }
             }
         }
         return null;
@@ -254,9 +373,16 @@ public class RTTIUtil {
             Address structAddr = space.getAddress(tiAddr);
 
             // Read __name pointer at offset 4
-            long namePtr = Integer.toUnsignedLong(mem.getInt(structAddr.add(PTR_SIZE)));
-            Address nameAddr = space.getAddress(namePtr);
-            nameStringAddrs.add(namePtr);
+            long namePtr;
+            Address nameAddr;
+            try {
+                namePtr = Integer.toUnsignedLong(mem.getInt(structAddr.add(PTR_SIZE)));
+                nameAddr = space.getAddress(namePtr);
+                nameStringAddrs.add(namePtr);
+            } catch (Exception e) {
+                script.printf("ERROR demangling: key = %08x ; value = %s\n", tiAddr, entry.getValue());
+                throw e;
+            }
 
             // Check if there's string data at the name address
             Listing listing = program.getListing();
@@ -270,7 +396,7 @@ public class RTTIUtil {
                     data = listing.getDataAt(nameAddr);
                 } catch (Exception e) {
                     script.println("    WARNING: Could not create string at 0x" +
-                            Long.toHexString(namePtr));
+                            nameAddr);
                     continue;
                 }
             }
@@ -280,12 +406,19 @@ public class RTTIUtil {
                 // Set symbol name with _ZTS prefix for demangling
                 String mangled = "_ZTS" + name;
                 Symbol[] syms = symTab.getSymbols(nameAddr);
-                if (syms == null || syms.length == 0) {
-                    symTable.createLabel(nameAddr, mangled, SourceType.USER_DEFINED);
-                } else {
-                    syms[0].setName(mangled, SourceType.DEFAULT);
+                try {
+                    if (syms == null || syms.length == 0) {
+                        symTable.createLabel(nameAddr, mangled, SourceType.USER_DEFINED);
+                    } else {
+                        syms[0].setName(mangled, SourceType.DEFAULT);
+                    }
+                    DemangleAndNameNamespace(program, nameAddr, script.getMonitor());
+                } catch (Exception e) {
+                    script.println("ERROR demangling: typeinfoAddr = 0x" + structAddr +
+                            " nameAddr = 0x" + nameAddr +
+                            " mangled = " + mangled);
+                    throw e;
                 }
-                DemangleAndNameNamespace(program, nameAddr, script.getMonitor());
             }
         }
     }
@@ -312,6 +445,7 @@ public class RTTIUtil {
                 if (entry.getValue().equals("__vmi_class_type_info")) {
                     Address addr = space.getAddress(entry.getKey());
                     int baseCount = mem.getInt(addr.add(12));
+//                    script.printf("    __vmi base_count = %d at 0x%08x\n", baseCount, entry.getKey());
                     baseCounts.add(baseCount);
                 }
             }

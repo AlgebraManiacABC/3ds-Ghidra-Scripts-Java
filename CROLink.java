@@ -12,7 +12,9 @@ import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import ghidra.util.exception.TimeoutException;
-import util.*;
+import util.CRXLibrary;
+import util.RTTIUtil;
+import util.RenameVTableFunctions;
 
 public class CROLink extends GhidraScript {
 
@@ -31,16 +33,37 @@ public class CROLink extends GhidraScript {
         for (DomainFile cro : croFolder.getFiles()) {
             CRXLibrary temp = new CRXLibrary(cro, pman, monitor);
             if (temp.isValidCRO0()) {
-                crxLibraries.add(new CRXLibrary(cro, pman, monitor));
+                crxLibraries.add(temp);
             }
         }
 
-        for (CRXLibrary crx : crxLibraries) {
+        for (var crx : crxLibraries) {
             crx.importModules(crxLibraries);
         }
         // Iterate through the list, linking each module to its imports
-        for (CRXLibrary crx : crxLibraries) {
+        for (var crx : crxLibraries) {
             crx.link(crxLibraries);
+        }
+        CRXLibrary codebin = crxLibraries.getFirst();
+        Symbol[] syms = codebin.program.getSymbolTable().getSymbols(codebin.getBaseAddr());
+        for (int i=0; i<syms.length; i++) {
+            if (i==0) syms[i].setName("Entry",SourceType.USER_DEFINED);
+            else syms[i].delete();
+        }
+        // Analyze the VTables (starting with static)
+        RTTIUtil rtti = new RTTIUtil(this);
+        RenameVTableFunctions renamer = new RenameVTableFunctions(this);
+        for (var crx : crxLibraries) {
+            int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
+            try {
+                rtti.run(crx.program);
+                Map<Long, Long> vtableRttiSlots = rtti.getVtableRttiSlots();
+                Set<Long> typeinfoAddresses = rtti.getTypeinfoAddresses();
+                if (vtableRttiSlots.isEmpty()) continue;
+                renamer.run(crx.program, vtableRttiSlots, typeinfoAddresses);
+            } finally {
+                crx.program.endTransaction(txId, true);
+            }
         }
         // Save or forget progress
         boolean shouldSave = askYesNo("Save?",
