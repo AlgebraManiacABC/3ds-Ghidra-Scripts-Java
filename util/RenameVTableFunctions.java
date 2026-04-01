@@ -23,14 +23,12 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.PointerDataType;
-import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 
-import java.math.BigInteger;
 import java.util.*;
 
 public class RenameVTableFunctions {
@@ -187,11 +185,6 @@ public class RenameVTableFunctions {
             script.println("... and " + (unreached - 20) + " more unreached classes.");
         }
 
-        script.println("    Functions renamed:      " + renameCount);
-        script.println("    Slots skipped (same):   " + skipCount);
-        script.println("    Pure virtual skipped:   " + pureVirtualCount);
-        script.println("    Unreached classes:      " + unreached);
-
         // Release CRO programs
         for (Program p : importedPrograms.values()) {
             if (p != null && p != program) {
@@ -240,6 +233,8 @@ public class RenameVTableFunctions {
             Reference[] refs = refMan.getReferencesFrom(addr);
             for (Reference ref : refs) {
                 if (ref instanceof ExternalReference extRef) {
+                    if (extRef.getLabel().contains("cxa_pure_virtual"))
+                        return true;
                     if (extRef.getExternalLocation().getAddress().equals(addr))
                         return true;
                 }
@@ -600,8 +595,6 @@ public class RenameVTableFunctions {
                             if (sym != null && (sym.getName().startsWith("FUN_") ||
                                     sym.getName().startsWith("thunk_"))) {
                                 sym.setName(appliedName, SourceType.USER_DEFINED);
-                                script.println("  " + ancestor + " slot " + slotIdx +
-                                        " -> " + appliedName);
                                 count++;
                             }
                         }
@@ -723,7 +716,7 @@ public class RenameVTableFunctions {
      * Detect __cxa_pure_virtual by finding a function pointer that appears
      * in vtable slots of two classes that share no inheritance relationship.
      */
-    private void detectPureVirtual() {
+    private void detectPureVirtual() throws Exception {
         // Pass 1: group non-zero slot values by class
         Map<Long, Set<String>> valuesToClasses = new HashMap<>();
         for (Map.Entry<String, List<List<Long>>> entry : allVtableSlots.entrySet()) {
@@ -797,7 +790,6 @@ public class RenameVTableFunctions {
         Set<ExternalLocation> extCandidates = new HashSet<>();
         ProgramManager pman = script.getState().getTool().getService(ProgramManager.class);
         for (Map.Entry<ExternalLocation, Set<String>> entry : extKeyToClasses.entrySet()) {
-//            script.printf("External Location: %s\n", entry.getKey());
             Address extAddr = entry.getKey().getAddress();
             String libName = entry.getKey().getLibraryName();
             String libPath = program.getExternalManager().getExternalLibraryPath(libName);
@@ -807,6 +799,7 @@ public class RenameVTableFunctions {
             for (var sym : syms) {
                 if (sym.getName().contains("cxa_pure_virtual")) {
                     extCandidates.add(entry.getKey());
+                    entry.getKey().getSymbol().setName("__cxa_pure_virtual", SourceType.USER_DEFINED);
                     located = true;
                 }
             }
@@ -815,6 +808,7 @@ public class RenameVTableFunctions {
                 for (var sym : syms) {
                     if (sym.getName().contains("cxa_pure_virtual")) {
                         extCandidates.add(entry.getKey());
+                        entry.getKey().getSymbol().setName("__cxa_pure_virtual", SourceType.USER_DEFINED);
                     }
                 }
             }
@@ -1090,8 +1084,11 @@ public class RenameVTableFunctions {
         for (int i = 0; i < mySlots.size(); i++) {
             long funcPtr = mySlots.get(i);
             Address slotAddr = start.add(4L * i);
-            if (isPureVirtualRef(slotAddr)) { pureVirtualCount++; continue; }
-            if (funcPtr == 0) { skipCount++; continue; }
+            boolean isExternal = false;
+            for (Reference r : program.getReferenceManager().getReferencesFrom(slotAddr)) {
+                if (r instanceof ExternalReference) { isExternal = true; break; }
+            }
+            if (isExternal) { skipCount++; continue; }
             if (i < parentSlotCount) {
                 if (funcPtr == parentSlots.get(i)) { skipCount++; continue; }
             }
