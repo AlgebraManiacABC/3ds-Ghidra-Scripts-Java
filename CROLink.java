@@ -53,12 +53,24 @@ public class CROLink extends GhidraScript {
         // Analyze the VTables (starting with static)
         RTTIUtil rtti = new RTTIUtil(this);
         RenameVTableFunctions renamer = new RenameVTableFunctions(this);
+        List<Map<Long, Long>> AllVtableRttiSlots = new ArrayList<>();
+        List<Set<Long>> AllTypeinfoAddresses = new ArrayList<>();
         for (var crx : crxLibraries) {
             int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
             try {
                 rtti.run(crx.program);
-                Map<Long, Long> vtableRttiSlots = rtti.getVtableRttiSlots();
-                Set<Long> typeinfoAddresses = rtti.getTypeinfoAddresses();
+                AllVtableRttiSlots.add(new HashMap<>(rtti.getVtableRttiSlots()));
+                AllTypeinfoAddresses.add(new HashSet<>(rtti.getTypeinfoAddresses()));
+            } finally {
+                crx.program.endTransaction(txId, true);
+            }
+        }
+        for (int i=0; i<crxLibraries.size(); i++) {
+            var crx = crxLibraries.get(i);
+            int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
+            try {
+                Map<Long, Long> vtableRttiSlots = AllVtableRttiSlots.get(i);
+                Set<Long> typeinfoAddresses = AllTypeinfoAddresses.get(i);
                 if (vtableRttiSlots.isEmpty()) continue;
                 renamer.run(crx.program, vtableRttiSlots, typeinfoAddresses);
             } finally {

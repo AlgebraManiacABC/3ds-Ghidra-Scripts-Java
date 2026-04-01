@@ -94,8 +94,6 @@ public class RTTIUtil {
                 cxxabiVtableAddrs.get(program.getName()).size());
         script.println("    Typeinfo structs:       " +
                 discoveredTypeinfos.size());
-        script.println("    Typeinfo strings:       " +
-                nameStringAddrs.size());
         script.println("    Vtables:                " +
                 vtableRttiSlots.size());
     }
@@ -221,8 +219,6 @@ public class RTTIUtil {
                 if (!cxxabiVtableAddrs.computeIfAbsent(program.getName(),
                         s -> new HashMap<>()).containsKey(addr)) {
                     cxxabiVtableAddrs.get(program.getName()).put(addr, rttiType);
-                    script.println("    Internal: " + sym.getName() +
-                            " at 0x" + addr + " -> " + rttiType);
                 }
             }
         }
@@ -242,18 +238,13 @@ public class RTTIUtil {
                 Symbol[] syms = extProg.getSymbolTable().getSymbols(extAddr);
                 for (Symbol sym : syms) {
                     String extName = sym.getName();
-//                    script.printf("Found %s at %s in %s ",extName,extAddr,extProg.getName());
                     String rttiType = classifySymbolName(extName);
                     if (rttiType == null) {
-//                        script.printf("(not RTTI)\n");
                         continue;
                     }
-//                    script.printf("- FOUND RTTI!\n");
                     if (!cxxabiVtableAddrs.computeIfAbsent(extProg.getName(),
                             s -> new HashMap<>()).containsKey(extAddr)) {
                         cxxabiVtableAddrs.get(extProg.getName()).put(extAddr, rttiType);
-                        script.println("    External: " + extName +
-                                " at 0x" + extAddr + " -> " + rttiType);
                     }
                 }
                 extProg.release(this);

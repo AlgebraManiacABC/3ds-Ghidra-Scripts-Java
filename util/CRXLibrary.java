@@ -120,6 +120,10 @@ public class CRXLibrary {
         if (save) {
             program.save("CROLink save", monitor);
         } else {
+            if (program.isLocked()) {
+                program.forceLock(true, "CROLink cleanup");
+                program.unlock();
+            }
             program.setTemporary(true);
         }
         program.release(this);

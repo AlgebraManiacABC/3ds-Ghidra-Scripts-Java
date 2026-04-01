@@ -15,6 +15,7 @@ package util;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.services.ProgramManager;
 import ghidra.app.util.NamespaceUtils;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.ProjectData;
@@ -190,7 +191,6 @@ public class RenameVTableFunctions {
         script.println("    Slots skipped (same):   " + skipCount);
         script.println("    Pure virtual skipped:   " + pureVirtualCount);
         script.println("    Unreached classes:      " + unreached);
-        script.println("=========================================================");
 
         // Release CRO programs
         for (Program p : importedPrograms.values()) {
@@ -644,8 +644,19 @@ public class RenameVTableFunctions {
 
             // Apply pointer data type at the RTTI slot
             try {
-                listing.clearCodeUnits(slotAddress,slotAddress,true);
+                Reference[] refs = program.getReferenceManager().getReferencesFrom(slotAddress);
+                Reference extRef = null;
+                for (Reference ref : refs) {
+                    if (ref.isExternalReference()) {
+                        extRef = ref;
+                        break;
+                    }
+                }
+                listing.clearCodeUnits(slotAddress, slotAddress, true);
                 listing.createData(slotAddress, PointerDataType.dataType);
+                if (extRef != null) {
+                    program.getReferenceManager().addReference(extRef);
+                }
             } catch (Exception e) { /* already applied */ }
 
             // Walk forward from the slot after the RTTI pointer to collect function pointers
@@ -676,11 +687,19 @@ public class RenameVTableFunctions {
 
                 // Apply pointer data type
                 try {
-
-                    if (listing.getDataAt(currentAddr) != null) {
-                        listing.clearCodeUnits(currentAddr, currentAddr, true);
+                    Reference[] refs = program.getReferenceManager().getReferencesFrom(currentAddr);
+                    Reference extRef = null;
+                    for (Reference ref : refs) {
+                        if (ref.isExternalReference()) {
+                            extRef = ref;
+                            break;
+                        }
                     }
+                    listing.clearCodeUnits(currentAddr, currentAddr, true);
                     listing.createData(currentAddr, PointerDataType.dataType);
+                    if (extRef != null) {
+                        program.getReferenceManager().addReference(extRef);
+                    }
                 } catch (Exception e) { /* already applied */ }
 
                 current += PTR_SIZE;
@@ -775,35 +794,49 @@ public class RenameVTableFunctions {
             }
         }
 
-        List<ExternalLocation> extCandidates = new ArrayList<>();
+        Set<ExternalLocation> extCandidates = new HashSet<>();
+        ProgramManager pman = script.getState().getTool().getService(ProgramManager.class);
         for (Map.Entry<ExternalLocation, Set<String>> entry : extKeyToClasses.entrySet()) {
-            if (entry.getValue().size() < 2) continue;
-            if (!entry.getKey().isFunction()) continue;
-            Function f = entry.getKey().getFunction();
-            Register tModeReg = program.getLanguage().getRegister("TMode");
-            BigInteger tMode = program.getProgramContext().getValue(tModeReg, f.getEntryPoint(), false);
-            boolean isThumb = tMode != null && tMode.intValue() == 1;
-            if (!isThumb) continue;
-            if (hasUnrelatedPair(entry.getValue())) {
-                extCandidates.add(entry.getKey());
+//            script.printf("External Location: %s\n", entry.getKey());
+            Address extAddr = entry.getKey().getAddress();
+            String libName = entry.getKey().getLibraryName();
+            String libPath = program.getExternalManager().getExternalLibraryPath(libName);
+            Program extProg = pman.openCachedProgram(script.parseDomainFile(libPath), this);
+            Symbol[] syms = extProg.getSymbolTable().getSymbols(extAddr);
+            boolean located = false;
+            for (var sym : syms) {
+                if (sym.getName().contains("cxa_pure_virtual")) {
+                    extCandidates.add(entry.getKey());
+                    located = true;
+                }
             }
+            if (!located && (extAddr.getOffset() & 1L) == 1) {
+                syms = extProg.getSymbolTable().getSymbols(extAddr.subtract(1));
+                for (var sym : syms) {
+                    if (sym.getName().contains("cxa_pure_virtual")) {
+                        extCandidates.add(entry.getKey());
+                    }
+                }
+            }
+            extProg.release(this);
         }
 
         if (extCandidates.isEmpty()) {
             return;
         }
 
-        ExternalLocation loc = extCandidates.getFirst();
+        ExternalLocation loc = extCandidates.stream().findFirst().get();
         externalPureVirtual = true;
         pureVirtualAddr = loc.getAddress() != null ? loc.getAddress().getOffset() : 0;
         script.println("    Detected external __cxa_pure_virtual: " + loc +
-                " (thumb function which appears in unrelated vtables)");
+                " in " + loc.getLibraryName());
 
         if (extCandidates.size() > 1) {
             script.println("    WARNING: " + extCandidates.size() +
                     " external candidates found for __cxa_pure_virtual:");
-            extCandidates.sort(Comparator.comparingInt(key -> extKeyToClasses.get(key).size()));
-            extCandidates.forEach(key -> script.println("  " + key +
+            extCandidates.stream().sorted(Comparator.comparingInt(
+                    key -> extKeyToClasses.get(key).size()))
+                    .forEach(key -> script.println("  " + key +
                     " (" + extKeyToClasses.get(key).size() + " classes)"));
         }
     }
