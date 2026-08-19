@@ -33,8 +33,10 @@ public class ExportAssembly extends GhidraScript {
                     case OperandType.ADDRESS | OperandType.SCALAR -> {
                         // [DAT_XYZ]
                         String addr_str = i.getDefaultOperandRepresentation(j);
-                        String addr_str_cut = addr_str.substring(1, addr_str.length() - 1);
-                        asm = asm.replace(addr_str, getSymbolAt(parseAddress(addr_str_cut)).getName());
+                        if (addr_str.contains("[")) {
+                            addr_str = addr_str.substring(1, addr_str.length() - 1);
+                        }
+                        asm = asm.replace(addr_str, getSymbolAt(parseAddress(addr_str)).getName());
                     }
                     case OperandType.ADDRESS | OperandType.CODE -> {
                         String addr_str = i.getDefaultOperandRepresentation(j);
