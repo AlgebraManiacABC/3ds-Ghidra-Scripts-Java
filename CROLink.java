@@ -37,45 +37,53 @@ public class CROLink extends GhidraScript {
             }
         }
 
-        for (var crx : crxLibraries) {
-            crx.importModules(crxLibraries);
-        }
-        // Iterate through the list, linking each module to its imports
-        for (var crx : crxLibraries) {
-            crx.link(crxLibraries);
-        }
-        CRXLibrary codebin = crxLibraries.getFirst();
-        Symbol[] syms = codebin.program.getSymbolTable().getSymbols(codebin.getBaseAddr());
-        for (int i=0; i<syms.length; i++) {
-            if (i==0) syms[i].setName("Entry",SourceType.USER_DEFINED);
-            else syms[i].delete();
-        }
-        // Analyze the VTables (starting with static)
-        RTTIUtil rtti = new RTTIUtil(this);
-        RenameVTableFunctions renamer = new RenameVTableFunctions(this);
-        List<Map<Long, Long>> AllVtableRttiSlots = new ArrayList<>();
-        List<Set<Long>> AllTypeinfoAddresses = new ArrayList<>();
-        for (var crx : crxLibraries) {
-            int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
-            try {
-                rtti.run(crx.program);
-                AllVtableRttiSlots.add(new HashMap<>(rtti.getVtableRttiSlots()));
-                AllTypeinfoAddresses.add(new HashSet<>(rtti.getTypeinfoAddresses()));
-            } finally {
-                crx.program.endTransaction(txId, true);
+        try {
+            for (var crx : crxLibraries) {
+                crx.importModules(crxLibraries);
             }
-        }
-        for (int i=0; i<crxLibraries.size(); i++) {
-            var crx = crxLibraries.get(i);
-            int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
-            try {
-                Map<Long, Long> vtableRttiSlots = AllVtableRttiSlots.get(i);
-                Set<Long> typeinfoAddresses = AllTypeinfoAddresses.get(i);
-                if (vtableRttiSlots.isEmpty()) continue;
-                renamer.run(crx.program, vtableRttiSlots, typeinfoAddresses);
-            } finally {
-                crx.program.endTransaction(txId, true);
+            // Iterate through the list, linking each module to its imports
+            for (var crx : crxLibraries) {
+                crx.link(crxLibraries);
             }
+            CRXLibrary codebin = crxLibraries.getFirst();
+            Symbol[] syms = codebin.program.getSymbolTable().getSymbols(codebin.getBaseAddr());
+            for (int i = 0; i < syms.length; i++) {
+                if (i == 0) syms[i].setName("Entry", SourceType.USER_DEFINED);
+                else syms[i].delete();
+            }
+            // Analyze the VTables (starting with static)
+            RTTIUtil rtti = new RTTIUtil(this);
+            RenameVTableFunctions renamer = new RenameVTableFunctions(this);
+            List<Map<Long, Long>> AllVtableRttiSlots = new ArrayList<>();
+            List<Set<Long>> AllTypeinfoAddresses = new ArrayList<>();
+            for (var crx : crxLibraries) {
+                int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
+                try {
+                    rtti.run(crx.program);
+                    AllVtableRttiSlots.add(new HashMap<>(rtti.getVtableRttiSlots()));
+                    AllTypeinfoAddresses.add(new HashSet<>(rtti.getTypeinfoAddresses()));
+                } finally {
+                    crx.program.endTransaction(txId, true);
+                }
+            }
+            for (int i = 0; i < crxLibraries.size(); i++) {
+                var crx = crxLibraries.get(i);
+                int txId = crx.program.startTransaction("RTTI Discovery Pipeline");
+                try {
+                    Map<Long, Long> vtableRttiSlots = AllVtableRttiSlots.get(i);
+                    Set<Long> typeinfoAddresses = AllTypeinfoAddresses.get(i);
+                    if (vtableRttiSlots.isEmpty()) continue;
+                    renamer.run(crx.program, vtableRttiSlots, typeinfoAddresses, monitor, state);
+                } finally {
+                    crx.program.endTransaction(txId, true);
+                }
+            }
+        } catch (Exception e) {
+            for (CRXLibrary crx : crxLibraries) {
+                if (crx.program == currentProgram) continue;
+                try { crx.cleanup(false); } catch (Exception ignored) {}
+            }
+            throw e;
         }
         // Save or forget progress
         boolean shouldSave = askYesNo("Save?",
