@@ -15,6 +15,7 @@ package util;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.script.GhidraState;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.NamespaceUtils;
 import ghidra.framework.model.DomainFile;
@@ -28,6 +29,7 @@ import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
+import ghidra.util.task.TaskMonitor;
 
 import java.util.*;
 
@@ -85,7 +87,8 @@ public class RenameVTableFunctions {
      * @param vtableRttiSlots  Map of vtable RTTI slot address -> typeinfo address
      * @param knownTypeinfos   Set of all known typeinfo struct addresses
      */
-    public void run(Program prog, Map<Long, Long> vtableRttiSlots, Set<Long> knownTypeinfos)
+    public void run(Program prog, Map<Long, Long> vtableRttiSlots, Set<Long> knownTypeinfos,
+                    TaskMonitor monitor, GhidraState state)
             throws Exception {
         // Clear state from any previous run
         typeinfoToClassName.clear();
@@ -169,6 +172,11 @@ public class RenameVTableFunctions {
 
         // Step 6: Propagate discovered names upward through the hierarchy
         propagateNames();
+
+        if (script.askYesNo("Auto Fill in Classes?",
+                "Run Auto Fill in Class for all discovered classes? This can take a long time!")) {
+            AutoFillClasses.fill(prog, monitor, state);
+        }
 
         // Report unreached classes
         int unreached = 0;

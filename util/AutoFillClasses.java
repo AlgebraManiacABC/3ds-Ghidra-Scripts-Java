@@ -1,24 +1,33 @@
-//@category RTTI
+package util;
+
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.util.FillOutStructureCmd;
-import ghidra.app.script.GhidraScript;
-import ghidra.program.model.listing.*;
-import ghidra.program.model.symbol.*;
+import ghidra.app.script.GhidraState;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.GhidraClass;
+import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.symbol.SymbolType;
 import ghidra.program.util.FunctionParameterFieldLocation;
+import ghidra.util.task.TaskMonitor;
 
 import java.util.ArrayList;
 import java.util.List;
 
-public class AutoFillClasses extends GhidraScript {
-    @Override
-    protected void run() throws Exception {
+public class AutoFillClasses {
+
+    public static String fill(Program program, TaskMonitor monitor, GhidraState state) {
         DecompileOptions options = DecompilerUtils.getDecompileOptions(
-                state.getTool(), currentProgram);
+                state.getTool(), program);
 
         // Collect all GhidraClass namespaces
         List<GhidraClass> classes = new ArrayList<>();
-        SymbolTable symTable = currentProgram.getSymbolTable();
+        SymbolTable symTable = program.getSymbolTable();
         SymbolIterator iter = symTable.getAllSymbols(false);
         while (iter.hasNext()) {
             Symbol sym = iter.next();
@@ -47,10 +56,10 @@ public class AutoFillClasses extends GhidraScript {
                 Symbol sym = classSyms.next();
                 if (sym.getSymbolType() != SymbolType.FUNCTION) continue;
 
-                Function func = getFunctionAt(sym.getAddress());
+                Function func = program.getFunctionManager().getFunctionAt(sym.getAddress());
                 if (func == null) continue;
 
-                switch (autoFillClassStructure(func, options)) {
+                switch (autoFillClassStructure(func, options, program, monitor)) {
                     case -1 -> failed++;
                     case 0 -> filled++;
                     case 1 -> skipped++;
@@ -58,15 +67,16 @@ public class AutoFillClasses extends GhidraScript {
             }
         }
 
-        println("\n=== SUMMARY ===");
-        println("Total classes:  " + totalClasses);
-        println("Filled:           " + filled);
-        println("Skipped:          " + skipped);
-        println("Failed:           " + failed);
+        return "\n=== AUTO-FILL SUMMARY FOR %s ===".formatted(program.getName().toUpperCase()) +
+                "\n\tTotal classes:  " + totalClasses +
+                "\n\tFilled:           " + filled +
+                "\n\tSkipped:          " + skipped +
+                "\n\tFailed:           " + failed;
     }
 
     // 0=success, 1=skipped, -1=failed
-    private int autoFillClassStructure(Function func, DecompileOptions options) {
+    private static int autoFillClassStructure(Function func, DecompileOptions options,
+                                              Program program, TaskMonitor monitor) {
         if (!"__thiscall".equals(func.getCallingConventionName()))
             return 1;
 
@@ -80,12 +90,12 @@ public class AutoFillClasses extends GhidraScript {
 
         try {
             FunctionParameterFieldLocation loc = new FunctionParameterFieldLocation(
-                    currentProgram, func.getEntryPoint(), null,
+                    program, func.getEntryPoint(), null,
                     0, null, thisParam);
 
 
             FillOutStructureCmd cmd = new FillOutStructureCmd(loc, options);
-            if (cmd.applyTo(currentProgram, monitor)) {
+            if (cmd.applyTo(program, monitor)) {
                 return 0;
             } else {
                 return -1;
