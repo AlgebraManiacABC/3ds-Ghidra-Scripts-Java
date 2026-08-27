@@ -403,7 +403,7 @@ public class RTTIUtil {
                     } else {
                         syms[0].setName(mangled, SourceType.DEFAULT);
                     }
-                    DemangleAndNameNamespace(program, nameAddr, script.getMonitor());
+                    DemangleAndNameNamespace(program, nameAddr, script.getMonitor(),false, true);
                 } catch (Exception e) {
                     script.println("ERROR demangling: typeinfoAddr = 0x" + structAddr +
                             " nameAddr = 0x" + nameAddr +

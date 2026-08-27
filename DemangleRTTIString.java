@@ -33,7 +33,7 @@ public class DemangleRTTIString extends GhidraScript {
             }
             String mangled = String.format("_ZTS%s",name);
             symbol.setName(mangled, SourceType.DEFAULT);
-            DemangleAndNameNamespace(currentProgram, addr, monitor);
+            DemangleAndNameNamespace(currentProgram, addr, monitor,false, false);
         } else {
             printf("The data at %s is not a String!\n", addr);
         }
