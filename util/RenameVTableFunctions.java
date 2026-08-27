@@ -23,12 +23,22 @@ import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.CategoryPath;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeConflictHandler;
+import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.FunctionDefinitionDataType;
+import ghidra.program.model.data.ParameterDefinitionImpl;
 import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.data.Structure;
+import ghidra.program.model.data.StructureDataType;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
+import ghidra.util.exception.DuplicateNameException;
+import ghidra.util.exception.InvalidInputException;
 import ghidra.util.task.TaskMonitor;
 
 import java.util.*;
@@ -173,6 +183,10 @@ public class RenameVTableFunctions {
         // Step 6: Propagate discovered names upward through the hierarchy
         propagateNames();
 
+        // Step 7: Assemble vtable structs for pretty decomp
+        buildVtableStructs();
+
+        // Step 8: Auto-fill classes (optional, takes forever)
         if (script.askYesNo("Auto Fill in Classes?",
                 "Run Auto Fill in Class for all discovered classes? This can take a long time!")) {
             AutoFillClasses.fill(prog, monitor, state);
@@ -1231,8 +1245,6 @@ public class RenameVTableFunctions {
                 }
 
                 program.getListing().clearCodeUnits(start, arrayEnd, true);
-                program.getListing().createData(start, new ArrayDataType(
-                        PointerDataType.dataType, arraySize, PTR_SIZE));
 
                 for (Map.Entry<Address, List<Reference>> entry : savedExtRefs.entrySet()) {
                     for (Reference ref : entry.getValue()) {
@@ -1252,5 +1264,154 @@ public class RenameVTableFunctions {
                 script.println("WARNING: Could not create vtable array at " + start);
             }
         }
+    }
+
+    private static final CategoryPath VTABLE_PATH = new CategoryPath("/vtables");
+    private static final CategoryPath VTFUNC_PATH  = new CategoryPath("/vtables/functions");
+
+    private DataType prepareBasicFuncDef(Program program) {
+        DataTypeManager dtm = program.getDataTypeManager();
+        int ptrSize = program.getDefaultPointerSize();
+        FunctionDefinitionDataType generic = new FunctionDefinitionDataType(VTFUNC_PATH, "vfunc");
+        generic.setReturnType(new PointerDataType(DataType.VOID, ptrSize));
+        generic.setArguments(new ParameterDefinitionImpl("this",
+                new PointerDataType(DataType.VOID, ptrSize), null));
+        generic.setVarArgs(true);
+        return new PointerDataType(dtm.resolve(generic, DataTypeConflictHandler.KEEP_HANDLER), ptrSize);
+    }
+
+    private void applyVtableStruct(Address point, Structure vt) throws InvalidInputException, DuplicateNameException {
+        ReferenceManager refMgr = program.getReferenceManager();
+        Map<Address, List<Reference>> saved = new HashMap<>();
+        for (int j = 0; j * PTR_SIZE < vt.getLength(); j++) {
+            Address a = point.add((long) j * PTR_SIZE);
+            for (Reference ref : refMgr.getReferencesFrom(a)) {
+                if (ref instanceof ExternalReference) {
+                    saved.computeIfAbsent(a, k -> new ArrayList<>()).add(ref);
+                }
+            }
+        }
+        try {
+            program.getListing().clearCodeUnits(point, point.add(vt.getLength() - 1L), true);
+            program.getListing().createData(point, vt);
+        } catch (Exception e) {
+            script.println("WARNING: Could not apply vtable struct at " + point);
+            return;
+        }
+        for (var e : saved.entrySet()) {
+            for (Reference ref : e.getValue()) {
+                if (ref instanceof ExternalReference ext) {
+                    refMgr.addExternalReference(e.getKey(), ext.getLibraryName(), ext.getLabel(),
+                            ext.getExternalLocation().getAddress(), ext.getSource(),
+                            ref.getOperandIndex(), ref.getReferenceType());
+                }
+            }
+        }
+    }
+
+    private void buildVtableStructs() throws Exception {
+        DataTypeManager dtm = program.getDataTypeManager();
+        AddressSpace space = program.getMinAddress().getAddressSpace();
+        DataType vFuncPtr = prepareBasicFuncDef(program);   // move this over from RTTIUtil
+        int built = 0;
+
+        for (Map.Entry<String, List<List<Long>>> entry : allVtableSlots.entrySet()) {
+            String className = entry.getKey();
+            List<List<Long>> subVtables = entry.getValue();
+            List<Address> points = allVtableAddressPoints.get(className);
+            if (points == null || points.size() != subVtables.size()) continue;
+            Structure primaryVt = null;
+
+            Namespace ns = classNamespaces.get(className);
+            if (ns == null) continue;
+            GhidraClass cls;
+            if (ns instanceof GhidraClass gc) {
+                cls = gc;
+            } else {
+                try {
+                    cls = symTab.convertNamespaceToClass(ns);
+                } catch (Exception e) {
+                    script.println("    WARNING: skipping vtable struct for " + className);
+                    continue;
+                }
+            }
+
+            for (int v = 0; v < subVtables.size(); v++) {
+                List<Long> slots = subVtables.get(v);
+                Address point = points.get(v);
+                if (slots.isEmpty()) continue;
+
+                String flat = cls.getName(true).replace("::", "_");
+                String structName = (v == 0) ? flat + "_vtable" : flat + "_vtable_" + v;
+                StructureDataType s = new StructureDataType(VTABLE_PATH, structName, 0, dtm);
+
+                Set<String> used = new HashSet<>();
+                for (int i = 0; i < slots.size(); i++) {
+                    s.add(vFuncPtr, fieldNameFor(space, point, slots.get(i), i, used), "slot " + i);
+                }
+
+                Structure resolved = (Structure) dtm.resolve(s, DataTypeConflictHandler.REPLACE_HANDLER);
+                applyVtableStruct(point, resolved);
+                if (v == 0) primaryVt = resolved;
+                built++;
+            }
+
+            if (primaryVt != null) linkClassStruct(dtm, cls, primaryVt);
+        }
+        script.printf("    Vtable structs built:   %d\n", built);
+    }
+
+    private void linkClassStruct(DataTypeManager dtm, GhidraClass cls, Structure vt) {
+        Structure cs = VariableUtilities.findExistingClassStruct(cls, dtm);
+        if (cs == null) {
+            Structure placeholder = VariableUtilities.findOrCreateClassStruct(cls, dtm);
+            if (placeholder == null) {          // name collides with an unrelated data type
+                script.println("    WARNING: no class struct available for " + cls.getName(true));
+                return;
+            }
+            cs = (Structure) dtm.resolve(placeholder, DataTypeConflictHandler.KEEP_HANDLER);
+        }
+
+        DataType vtPtr = new PointerDataType(vt, PTR_SIZE);
+        try {
+            if (cs.getLength() < PTR_SIZE) {
+                cs.insertAtOffset(0, vtPtr, PTR_SIZE, "vtbl", "vtable pointer");
+            } else {
+                cs.replaceAtOffset(0, vtPtr, PTR_SIZE, "vtbl", "vtable pointer");
+            }
+        } catch (Exception e) {
+            script.println("    WARNING: could not set vtbl on " + cls.getName() + ": " + e.getMessage());
+        }
+    }
+
+    private String fieldNameFor(AddressSpace space, Address point, long funcPtr,
+                                int i, Set<String> used) throws MemoryAccessException {
+        Address slotAddr = point.add(4L * i);
+        String base = null;
+
+        // external label first — an imported virtual also reads as funcPtr == 0
+        for (Reference r : program.getReferenceManager().getReferencesFrom(slotAddr)) {
+            if (r instanceof ExternalReference ext && ext.getLabel() != null) {
+                base = ext.getLabel();
+                break;
+            }
+        }
+        if (base == null && (isPureVirtualRef(slotAddr) || funcPtr == 0)) {
+            base = "__cxa_pure_virtual";
+        }
+        if (base == null) {
+            Function f = program.getFunctionManager()
+                    .getFunctionAt(space.getAddress(funcPtr & ~1L));
+            if (f != null) base = f.getName();
+        }
+        if (base == null) base = "slot";
+
+        base = base.replaceAll("[^A-Za-z0-9_]", "_");
+        if (base.isEmpty() || Character.isDigit(base.charAt(0))) base = "_" + base;
+
+        String name = base;
+        int n = 1;
+        while (!used.add(name)) name = base + "_" + (n++);   // overloads collide otherwise
+        return name;
     }
 }
