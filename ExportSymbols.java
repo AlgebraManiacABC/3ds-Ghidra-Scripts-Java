@@ -25,13 +25,15 @@ public class ExportSymbols extends GhidraScript {
     class SymbolData implements Comparable<SymbolData> {
         Address addr;
         String name;
+        String namespace;
         String mode;
         long size;
         String segment;
 
-        SymbolData(Address addr, String name, String mode, long size, String segment) {
+        SymbolData(Address addr, String name, String namespace, String mode, long size, String segment) {
             this.addr = addr;
             this.name = name;
+            this.namespace = namespace;
             this.mode = mode;
             this.size = size;
             this.segment = segment;
@@ -43,7 +45,7 @@ public class ExportSymbols extends GhidraScript {
 
         @Override
         public String toString() {
-            return String.format("\"%s\",\"%s\",%s,%08x,\"%s\"",addr,name,mode,size,segment);
+            return String.format("\"%s\",\"%s\",\"%s\",%s,%08x,\"%s\"",addr,name,namespace,mode,size,segment);
         }
     }
 
@@ -98,7 +100,7 @@ public class ExportSymbols extends GhidraScript {
         } else {
             File outFile = askFile("Output file", "OK");
             PrintWriter out = new PrintWriter(new FileWriter(outFile));
-            out.println("Location,Name,Mode,Size,Segment");
+            out.println("Location,Name,Namespace,Mode,Size,Segment");
             List<SymbolData> symbols = extractSymbols(currentProgram, unique);
             symbols.stream().sorted().forEach(out::println);
             out.close();
@@ -122,7 +124,8 @@ public class ExportSymbols extends GhidraScript {
             boolean hasExternalRef = Arrays.stream(rm.getReferencesFrom(addr))
                     .anyMatch(Reference::isExternalReference);
             if (hasExternalRef) continue;
-            String name = symbol.getName(true);
+            String name = symbol.getName(false);
+            String namespace = symbol.getParentNamespace().getName(true);
             String mode = null;
             CodeUnit cu = program.getListing().getCodeUnitAt(addr);
             Function f = fm.getFunctionAt(addr);
@@ -166,7 +169,7 @@ public class ExportSymbols extends GhidraScript {
                                     "to .text by default!\n", addr, symbol.getName());
                         }
                         symbolCounts.computeIfAbsent(ranged_name, k -> new ArrayList<>())
-                                .add(new SymbolData(ranged_addr, ranged_name, mode, ranged_size, segName));
+                                .add(new SymbolData(ranged_addr, ranged_name, namespace, mode, ranged_size, segName));
                     }
                     continue;
                 }
@@ -187,7 +190,7 @@ public class ExportSymbols extends GhidraScript {
                         "to .text by default!\n", addr, symbol.getName());
             }
             symbolCounts.computeIfAbsent(name, k -> new ArrayList<>())
-                    .add(new SymbolData(addr, name, mode, size, segName));
+                    .add(new SymbolData(addr, name, namespace, mode, size, segName));
         }
 
         List<SymbolData> symbols = new ArrayList<>();
