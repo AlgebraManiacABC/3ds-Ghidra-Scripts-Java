@@ -70,7 +70,7 @@ public class ExportSymbols extends GhidraScript {
                 PrintWriter out = new PrintWriter(new FileWriter(outFile));
                 Program p = pman.openCachedProgram(file, this);
 
-                out.println("Location,Name,Mode,Size,Segment");
+                out.println("Location,Name,Namespace,Mode,Size,Segment");
                 List<SymbolData> symbols = extractSymbols(p, unique);
                 for (SymbolData symbol : symbols) {
                     out.println(symbol);
@@ -84,7 +84,7 @@ public class ExportSymbols extends GhidraScript {
             DomainFolder folder = askProjectFolder("Select Directory to Symbolify");
             File outFile = askFile("Output file", "OK");
             PrintWriter out = new PrintWriter(new FileWriter(outFile));
-            out.println("Module,Location,Name,Mode,Size,Segment");
+            out.println("Module,Location,Name,Namespace,Mode,Size,Segment");
             List<DomainFile> files_to_symbolify = getAllFilesInDirectory(folder);
             ProgramManager pman = getState().getTool().getService(ProgramManager.class);
             Map<String, List<SymbolData>> symbols = new HashMap<>();
@@ -205,6 +205,8 @@ public class ExportSymbols extends GhidraScript {
                     symbols.add(sdList.getFirst());
                 }
             }
+        } else {
+            symbolCounts.values().forEach(symbols::addAll);
         }
         symbols.sort(SymbolData::compareTo);
         return symbols;
