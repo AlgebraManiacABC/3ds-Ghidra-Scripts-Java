@@ -43,6 +43,9 @@ public class CRXLibrary {
 
     public Program program;
 
+    /** Set once cleanup() has dropped our consumer reference on the program. */
+    private boolean released = false;
+
     /**
      * Contains the Library corresponding to the respective
      *   program('s external manager) in the CRXLibrary
@@ -102,31 +105,40 @@ public class CRXLibrary {
     }
 
     public void cleanup(boolean save) throws Exception {
-        AutoAnalysisManager.getAnalysisManager(program).cancelQueuedTasks();
-        AutoAnalysisManager.getAnalysisManager(program).dispose();
-        int i;
-        for(i=0; program.getCurrentTransactionInfo() != null && i < 60; i++) {
-            Thread.sleep(1000);
-        }
-        if (i == 60) {
-            TransactionInfo info = program.getCurrentTransactionInfo();
-            String error = String.format(
-                    "Program %s hung on transaction: %s (%s) [%d] - forcibly closing",
-                    program,info.getDescription(), info.getStatus(), info.getID());
-            Msg.error(this,error);
-            throw new TimeoutException(error);
-        }
-        program.clearUndo();
-        if (save) {
-            program.save("CROLink save", monitor);
-        } else {
-            if (program.isLocked()) {
-                program.forceLock(true, "CROLink cleanup");
-                program.unlock();
+        // An invalid module never opened a program, and a second cleanup would
+        // release a reference we no longer hold.
+        if (program == null || released) return;
+        try {
+            AutoAnalysisManager.getAnalysisManager(program).cancelQueuedTasks();
+            AutoAnalysisManager.getAnalysisManager(program).dispose();
+            int i;
+            for(i=0; program.getCurrentTransactionInfo() != null && i < 60; i++) {
+                Thread.sleep(1000);
             }
-            program.setTemporary(true);
+            if (i == 60) {
+                TransactionInfo info = program.getCurrentTransactionInfo();
+                String error = String.format(
+                        "Program %s hung on transaction: %s (%s) [%d] - forcibly closing",
+                        program,info.getDescription(), info.getStatus(), info.getID());
+                Msg.error(this,error);
+                throw new TimeoutException(error);
+            }
+            program.clearUndo();
+            if (save) {
+                program.save("CROLink save", monitor);
+            } else {
+                if (program.isLocked()) {
+                    program.forceLock(true, "CROLink cleanup");
+                    program.unlock();
+                }
+                program.setTemporary(true);
+            }
+        } finally {
+            // Drop our consumer reference no matter how we got here: a save
+            // failure or a hung transaction must not strand the program open.
+            released = true;
+            program.release(this);
         }
-        program.release(this);
     }
 
     boolean disassemble(Address addr, boolean thumb) {
@@ -162,10 +174,10 @@ public class CRXLibrary {
                         continue;
                     }
                     if (applied) {
-                        program.getSymbolTable().removeSymbolSpecial(mangled);
+//                        program.getSymbolTable().removeSymbolSpecial(mangled);
                         Function func = program.getFunctionManager().getFunctionAt(addr);
                         if (func != null) {
-                            func.setName(obj.getName(), SourceType.IMPORTED);
+                            applyFunctionNameHere(obj.getName(), addr);
                             if (obj.getNamespace() != null) {
                                 Namespace ns = NamespaceUtils.createNamespaceHierarchy(
                                         obj.getNamespace().toString(),
@@ -278,6 +290,12 @@ public class CRXLibrary {
         Function temp = program.getListing().getFunctionAt(addr);
         // If not a function entrypoint, can we make it one?
         if (temp == null) {
+            // Disassemble first: CreateFunctionCmd derives the body from flow, so on
+            // undisassembled bytes it produces a 1-byte body that later disassembly
+            // never grows.
+            if (program.getListing().getInstructionAt(addr) == null) {
+                disassemble(addr, thumb);
+            }
             createFunctionHere(name, addr);
             temp = program.getListing().getFunctionAt(addr);
         }
@@ -289,7 +307,10 @@ public class CRXLibrary {
                 temp.setName(name, SourceType.IMPORTED);
             } catch (DuplicateNameException e) {
                 Symbol[] ss = program.getSymbolTable().getSymbols(addr);
-                for (Symbol s : ss) program.getSymbolTable().removeSymbolSpecial(s);
+                for (Symbol s : ss) {
+                    if (s.getName().equals(name))
+                        program.getSymbolTable().removeSymbolSpecial(s);
+                }
                 temp.setName(name, SourceType.IMPORTED);
             }
             program.endTransaction(tx_id, true);
