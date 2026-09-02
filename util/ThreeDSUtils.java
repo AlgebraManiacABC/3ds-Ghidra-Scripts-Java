@@ -17,8 +17,10 @@ import ghidra.app.services.ProgramManager;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.symbol.*;
+import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.symbol.SourceType;
 
 public class ThreeDSUtils {
@@ -186,5 +188,52 @@ public class ThreeDSUtils {
         return relocs;
     }
 
+    // Guard against a runaway walk through mis-disassembled code.
+    public static final long MAX_BODY_BYTES = 0x10000;
 
+    /**
+     * Derive a function's body by walking flow from its entry point: fall-through and
+     * branch targets, but never into a call target or another function's entry point.
+     * <p>
+     * Functions created by CreateFunctionCmd before their bytes were disassembled keep
+     * a 1-byte body forever, since later disassembly does not grow it. This recomputes
+     * what the body should have been.
+     */
+    public static AddressSet deriveFunctionBody(Program program, Function func,
+                                                TaskMonitor monitor) throws CancelledException {
+        AddressSet body = new AddressSet();
+        Address entry = func.getEntryPoint();
+        Listing listing = program.getListing();
+        FunctionManager fm = program.getFunctionManager();
+
+        Deque<Address> work = new ArrayDeque<>();
+        work.push(entry);
+
+        while (!work.isEmpty()) {
+            if (monitor != null) monitor.checkCancelled();
+            Address addr = work.pop();
+            if (body.contains(addr)) continue;
+            if (body.getNumAddresses() > MAX_BODY_BYTES) break;
+
+            // Do not absorb another function
+            if (!addr.equals(entry) && fm.getFunctionAt(addr) != null) continue;
+
+            Instruction instr = listing.getInstructionAt(addr);
+            if (instr == null) continue;
+
+            body.addRange(instr.getMinAddress(), instr.getMaxAddress());
+
+            FlowType flow = instr.getFlowType();
+            if (!flow.isCall()) {
+                for (Address target : instr.getFlows()) {
+                    if (target != null) work.push(target);
+                }
+            }
+            if (!flow.isTerminal()) {
+                Address next = instr.getFallThrough();
+                if (next != null) work.push(next);
+            }
+        }
+        return body;
+    }
 }
