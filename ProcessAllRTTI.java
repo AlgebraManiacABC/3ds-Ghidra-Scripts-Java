@@ -39,7 +39,7 @@ public class ProcessAllRTTI extends GhidraScript {
 
         // Step 5: Rename vtable functions
         RenameVTableFunctions renamer = new RenameVTableFunctions(this);
-        renamer.run(currentProgram, vtableRttiSlots, typeinfoAddresses);
+        renamer.run(currentProgram, vtableRttiSlots, typeinfoAddresses, monitor, state);
 
         println("\n=== All Done ===");
     }
