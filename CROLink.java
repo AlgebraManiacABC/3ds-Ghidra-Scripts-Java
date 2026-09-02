@@ -11,7 +11,7 @@ import ghidra.framework.model.*;
 import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
-import ghidra.util.exception.TimeoutException;
+import util.AutoFillClasses;
 import util.CRXLibrary;
 import util.RTTIUtil;
 import util.RenameVTableFunctions;
@@ -29,15 +29,16 @@ public class CROLink extends GhidraScript {
         File crsFile = askFile("Select static.crs","OK");
         DomainFolder croFolder = askProjectFolder("Select the cro directory");
         ProgramManager pman = getState().getTool().getService(ProgramManager.class);
-        crxLibraries.add(new CRXLibrary(codeFile, crsFile, pman, monitor));
-        for (DomainFile cro : croFolder.getFiles()) {
-            CRXLibrary temp = new CRXLibrary(cro, pman, monitor);
-            if (temp.isValidCRO0()) {
-                crxLibraries.add(temp);
-            }
-        }
-
+        boolean shouldSave = false;
         try {
+            crxLibraries.add(new CRXLibrary(codeFile, crsFile, pman, monitor));
+            for (DomainFile cro : croFolder.getFiles()) {
+                CRXLibrary temp = new CRXLibrary(cro, pman, monitor);
+                if (temp.isValidCRO0()) {
+                    crxLibraries.add(temp);
+                }
+            }
+
             for (var crx : crxLibraries) {
                 crx.importModules(crxLibraries);
             }
@@ -78,24 +79,35 @@ public class CROLink extends GhidraScript {
                     crx.program.endTransaction(txId, true);
                 }
             }
-        } catch (Exception e) {
+            // Step 8: Auto-fill classes (optional, takes forever)
+            if (askYesNo("Auto Fill in Classes?",
+                    "Run Auto Fill in Class for all discovered classes? This can take a long time!")) {
+                for (var crx : crxLibraries) {
+                    int txId = crx.program.startTransaction("Auto-Fill Classes");
+                    try {
+                        AutoFillClasses.fill(crx.program, monitor, state);
+                    } finally {
+                        crx.program.endTransaction(txId, true);
+                    }
+                }
+            }
+            // Save or forget progress
+            shouldSave = askYesNo("Save?",
+                    String.format("%d modules linked successfully!\nDo you want to save? " +
+                                    "If not, progress in external libraries will be lost, and this script must be ran again.",
+                            crxLibraries.size()));
+        } finally {
+            // Every library holds a consumer reference on its program. Release
+            // them here so an abort partway through construction or linking
+            // cannot strand programs open in the project.
             for (CRXLibrary crx : crxLibraries) {
                 if (crx.program == currentProgram) continue;
-                try { crx.cleanup(false); } catch (Exception ignored) {}
-            }
-            throw e;
-        }
-        // Save or forget progress
-        boolean shouldSave = askYesNo("Save?",
-                String.format("%d modules linked successfully!\nDo you want to save? " +
-                                "If not, progress in external libraries will be lost, and this script must be ran again.",
-                        crxLibraries.size()));
-        for (CRXLibrary crx : crxLibraries) {
-            if (crx.program == currentProgram) continue;
-            try {
-                crx.cleanup(shouldSave);
-            } catch (TimeoutException e) {
-                closeProgram(crx.program);
+                try {
+                    crx.cleanup(shouldSave);
+                } catch (Exception e) {
+                    printerr(String.format("Cleanup of %s failed: %s",
+                            crx.program, e.getMessage()));
+                }
             }
         }
     }
