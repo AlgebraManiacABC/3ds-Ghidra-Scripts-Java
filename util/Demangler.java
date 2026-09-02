@@ -53,8 +53,25 @@ public class Demangler {
         }
 
         if (!makePrimary) {
+            SymbolTable symTab = program.getSymbolTable();
+
+            // At a function entry point the function symbol always holds primacy, so
+            // setPrimary() on a plain label there does nothing. Move the mangled name
+            // onto the function itself first (the old function name comes back below as
+            // a label, since the demangled name is what it will have been).
+            Symbol funcSym = (func == null) ? null : func.getSymbol();
+            if (funcSym != null && !funcSym.equals(mangledSym)) {
+                String mangledName = mangledSym.getName();
+                Namespace mangledNs = mangledSym.getParentNamespace();
+                SourceType source = mangledSym.getSource();
+                if (source == SourceType.DEFAULT) source = SourceType.USER_DEFINED;
+                symTab.removeSymbolSpecial(mangledSym);
+                funcSym.setNameAndNamespace(mangledName, mangledNs, source);
+                mangledSym = funcSym;
+            }
+
             // Add alongside the mangled symbol, then make sure it stayed on top.
-            program.getSymbolTable().createLabel(addr, name,
+            symTab.createLabel(addr, name,
                     ns == null ? program.getGlobalNamespace() : ns,
                     SourceType.ANALYSIS);
             mangledSym.setPrimary();
@@ -70,7 +87,7 @@ public class Demangler {
         return true;
     }
 
-    private static Namespace resolveNamespace(Program program, DemangledObject obj)
+    public static Namespace resolveNamespace(Program program, DemangledObject obj)
             throws Exception {
         String full = obj.getNamespaceString();
         if (full == null) return null;
