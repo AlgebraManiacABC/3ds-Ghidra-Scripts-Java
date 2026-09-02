@@ -23,6 +23,7 @@ import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
+import ghidra.util.exception.InvalidInputException;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -169,7 +170,9 @@ public class RTTIUtil {
                 if (here != tiPtr) continue;
                 // Otherwise, this is a reference to the typeinfo struct!
                 if (!isInsideTypeInfoBase(off, typeinfoStructAddrs)) {
-                    refs.put(off, entry.getValue());
+                    // A typeinfo's vptr stores vtable+8 (the first virtual function slot),
+                    // which is off+4 here. off itself (vtable+4, the vtable's own typeinfo
+                    // slot) is never stored anywhere, so registering it only adds noise.
                     refs.put(off.add(4), entry.getValue());
                     // Label the head and first ptr
                     symTab.createLabel(off.add(4),entry.getValue() + "_vtable", SourceType.USER_DEFINED);
@@ -253,10 +256,25 @@ public class RTTIUtil {
     }
 
     /**
-     * Check if a symbol name refers to a __cxxabiv1 typeinfo class.
+     * Check if a symbol name refers to the *vtable* of a __cxxabiv1 typeinfo class.
      * Returns the base type name or null.
+     * <p>
+     * Only vtable symbols may qualify: the typeinfo struct (_ZTI...) and the typeinfo
+     * name string (_ZTS...) of the same class carry the class name too, and accepting
+     * those makes unrelated words (e.g. a __base_type field pointing at another module's
+     * _ZTI symbol) look like typeinfo vptrs.
      */
     private String classifySymbolName(String name) {
+        if (name == null) return null;
+        if (!isVtableSymbolName(name)) return null;
+        return classifyCxxabiClassName(name);
+    }
+
+    /**
+     * Match the __cxxabiv1 typeinfo class name inside a symbol name, ignoring what kind
+     * of symbol it is. Returns the base type name or null.
+     */
+    private String classifyCxxabiClassName(String name) {
         if (name == null) return null;
         // Order matters: check __vmi first, then __si, then __class
         // to avoid false matches (e.g. "__class" matching inside "__si_class")
@@ -265,6 +283,20 @@ public class RTTIUtil {
         if (name.contains("__class_type_info")) return "__class_type_info";
 
         return null;
+    }
+
+    /** True if the symbol name denotes a vtable rather than a typeinfo struct or name string. */
+    private boolean isVtableSymbolName(String name) {
+        // _ZTI = typeinfo struct, _ZTS = typeinfo name string, and Ghidra's demangled
+        // forms of those end in "typeinfo" / "typeinfo-name".
+        if (name.startsWith("_ZTI") || name.startsWith("_ZTS")) return false;
+        int sep = name.lastIndexOf("::");
+        String last = (sep < 0) ? name : name.substring(sep + 2);
+        if (last.equals("typeinfo") || last.equals("typeinfo-name")) return false;
+
+        // _ZTV = vtable; "vtable" also covers the demangled form and the
+        // "X_vtable" / "X::vtable" labels created by scanForTypeInfoRefs.
+        return name.startsWith("_ZTV") || name.contains("vtable");
     }
 
     // ---------------------------------------------------------------
@@ -359,6 +391,10 @@ public class RTTIUtil {
         AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
         SymbolTable symTable = program.getSymbolTable();
 
+        // Typeinfo candidates whose __name is not a mangled type name: false positives
+        // from the .rodata scan. Collected here and dropped after the loop.
+        List<Long> bogus = new ArrayList<>();
+
         for (Map.Entry<Long, String> entry : discoveredTypeinfos.entrySet()) {
             long tiAddr = entry.getKey();
             Address structAddr = space.getAddress(tiAddr);
@@ -369,11 +405,18 @@ public class RTTIUtil {
             try {
                 namePtr = Integer.toUnsignedLong(mem.getInt(structAddr.add(PTR_SIZE)));
                 nameAddr = space.getAddress(namePtr);
-                nameStringAddrs.add(namePtr);
             } catch (Exception e) {
                 script.printf("ERROR demangling: key = %08x ; value = %s\n", tiAddr, entry.getValue());
                 throw e;
             }
+
+            if (!mem.getLoadedAndInitializedAddressSet().contains(nameAddr)) {
+                script.printf("    WARNING: typeinfo at 0x%08x has __name -> 0x%s " +
+                        "(not initialized memory); dropping as false positive\n", tiAddr, nameAddr);
+                bogus.add(tiAddr);
+                continue;
+            }
+            nameStringAddrs.add(namePtr);
 
             // Check if there's string data at the name address
             Listing listing = program.getListing();
@@ -394,16 +437,44 @@ public class RTTIUtil {
 
             SymbolTable symTab = program.getSymbolTable();
             if (data != null && data.getValue() instanceof String name) {
+                if (!isPlausibleMangledTypeName(name)) {
+                    script.printf("    WARNING: typeinfo at 0x%08x has __name -> 0x%s " +
+                            "which is not a mangled type name (%s); " +
+                            "dropping as false positive\n", tiAddr, nameAddr, describe(name));
+                    bogus.add(tiAddr);
+                    continue;
+                }
                 // Set symbol name with _ZTS prefix for demangling
                 String mangled = "_ZTS" + name;
-                Symbol[] syms = symTab.getSymbols(nameAddr);
                 try {
-                    if (syms == null || syms.length == 0) {
-                        symTable.createLabel(nameAddr, mangled, SourceType.USER_DEFINED);
-                    } else {
-                        syms[0].setName(mangled, SourceType.DEFAULT);
+                    // Reuse the mangled symbol if it is already here (earlier run), otherwise
+                    // add it. Never rename an arbitrary existing symbol: on a re-run syms[0]
+                    // may well be the demangled label from last time.
+                    Symbol mangledSym = null;
+                    for (Symbol sym : symTab.getSymbols(nameAddr)) {
+                        if (sym.getName().equals(mangled)) {
+                            mangledSym = sym;
+                            break;
+                        }
                     }
+                    if (mangledSym == null) {
+                        mangledSym = symTable.createLabel(nameAddr, mangled, SourceType.USER_DEFINED);
+                    }
+                    mangledSym.setPrimary();
+
                     DemangleAndNameNamespace(program, nameAddr, script.getMonitor(),false, true);
+
+                    // The demangled label is added alongside; make sure the mangled name
+                    // is still the primary symbol afterwards.
+                    if (!mangledSym.isPrimary()) {
+                        mangledSym.setPrimary();
+                    }
+                } catch (InvalidInputException e) {
+                    // Never let one bad candidate abort a multi-module run
+                    script.println("    WARNING: could not name typeinfo string: typeinfoAddr = 0x" +
+                            structAddr + " nameAddr = 0x" + nameAddr +
+                            " mangled = " + mangled + " : " + e.getMessage());
+                    bogus.add(tiAddr);
                 } catch (Exception e) {
                     script.println("ERROR demangling: typeinfoAddr = 0x" + structAddr +
                             " nameAddr = 0x" + nameAddr +
@@ -412,6 +483,39 @@ public class RTTIUtil {
                 }
             }
         }
+
+        for (long tiAddr : bogus) {
+            discoveredTypeinfos.remove(tiAddr);
+        }
+        if (!bogus.isEmpty()) {
+            script.printf("    Dropped %d false-positive typeinfo candidate(s)\n", bogus.size());
+        }
+    }
+
+    /**
+     * True if the string looks like an Itanium mangled type name, i.e. something that
+     * can legally follow the _ZTS prefix and be accepted by SymbolUtilities.validateName.
+     */
+    private boolean isPlausibleMangledTypeName(String name) {
+        if (name == null || name.isEmpty() || name.length() > 512) return false;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            boolean ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '.';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /** Printable rendering of a possibly-garbage string, for warnings. */
+    private String describe(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length() && i < 16; i++) {
+            char c = s.charAt(i);
+            if (c >= 0x20 && c < 0x7f) sb.append(c);
+            else sb.append(String.format("\\x%02x", (int) c & 0xff));
+        }
+        return sb.toString();
     }
 
     // ---------------------------------------------------------------
