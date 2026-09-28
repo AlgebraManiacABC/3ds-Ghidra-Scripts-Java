@@ -10,6 +10,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Comparator;
 
@@ -31,6 +32,33 @@ final class Util {
     static int getInt(final byte[] arr, final long off) {
         return ByteBuffer.wrap(arr, (int) off, Integer.BYTES)
                 .order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    /**
+     * Reads a NUL-terminated String from the byte array
+     * @param arr The byte array from which to read
+     * @param off The offset into the array at which to start reading
+     * @return The String found at the given offset into the array
+     */
+    static String readCString(final byte[] arr, final int off) {
+        int end = off;
+        while (end < arr.length && arr[end] != 0) end++;
+        return new String(arr, off, end - off, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Reads a NUL-terminated String from the byte array,
+     *  given a max length to read
+     * @param arr The byte array from which to read
+     * @param off The offset into the array at which to start reading
+     * @param len The maximum length to read
+     *            (will truncate any String at that length)
+     * @return The String found at the given offset into the array
+     */
+    static String readCString(final byte[] arr, final int off, final int len) {
+        int end = off;
+        while (end < arr.length && end - off < len && arr[end] != 0) end++;
+        return new String(arr, off, end - off, StandardCharsets.UTF_8);
     }
 
     /**
