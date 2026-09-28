@@ -48,6 +48,7 @@ final class Util {
 
     /**
      * Reads all bytes from the given Ghidra Program.
+     * The Program MUST be open.
      *
      * <p>Note: Discontiguous memory regions will leave
      *  zero-padding between regions.</p>
@@ -59,7 +60,11 @@ final class Util {
     static byte[] readProgramBytes(final Program program)
             throws MemoryAccessException {
         byte[] bytes;
-        if (program == null) return null;
+        if (program == null || program.isClosed()) {
+            throw new IllegalArgumentException(
+                    "Provided program was not open!"
+                    + " Please open the program before reading bytes.");
+        }
         Memory memory = program.getMemory();
         MemoryBlock[] blocks = Arrays.stream(memory.getBlocks())
                 .filter(MemoryBlock::isInitialized)
