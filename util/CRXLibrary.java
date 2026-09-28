@@ -3,6 +3,9 @@ package util;
 import ghidra.framework.model.DomainFile;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.exception.VersionException;
+import ghidra.util.task.TaskMonitor;
 
 import java.io.File;
 import java.io.IOException;
@@ -11,7 +14,7 @@ import java.util.Arrays;
 
 /**
  */
-public final class CRXLibrary {
+public final class CRXLibrary implements AutoCloseable {
 
     /** The file's magic identifier */
     private static final byte[] CRO0_MAGIC =
@@ -31,33 +34,67 @@ public final class CRXLibrary {
     /** The raw bytes from the associated crx file
      * If this is code.bin, then this contains static.crs */
     private final byte[] crxBytes;
+    /** The Ghidra Program associated with this module */
+    private final Program program;
+    /** The Ghidra Program's DomainFile */
+    private final DomainFile programFile;
 
     private CRXLibrary(final CRXBuilder b) {
         name = b.name;
         segments = b.segments;
         crxBytes = b.crxBytes;
+        program = b.program;
+        programFile = b.programFile;
     }
 
     static class CRXBuilder {
         /** Mirrors CRXLibrary */
-        private final String name;
+        private String name;
         /** Mirrors CRXLibrary */
-        private final SegmentBlock[] segments;
+        private SegmentBlock[] segments;
         /** Mirrors CRXLibrary */
-        private final byte[] crxBytes;
+        private byte[] crxBytes;
+        /** Mirrors CRXLibrary */
+        private Program program;
+        /** Mirrors CRXLibrary */
+        private final DomainFile programFile;
+        /** The Ghidra Task Monitor */
+        private final TaskMonitor monitor;
 
         /**
          * Constructs a builder for a CRXLibrary
          *
-         * @param crxBytes The real bytes of the original crx file
-         * @param program  The Ghidra Program containing this library
+         * @param programFile The Ghidra DomainFile associated with this module
+         * @param monitor The Ghidra Task Monitor
          */
-        CRXBuilder(final byte[] crxBytes,
-                   final Program program) throws IOException {
-            this.crxBytes = crxBytes;
-            if (!hasCRO0Magic(this.crxBytes)) {
-                throw new IOException("Not a CRO0 file: Lacking CRO0 magic");
+        CRXBuilder(final DomainFile programFile, final TaskMonitor monitor)
+                throws IOException {
+            this.programFile = programFile;
+            this.monitor = monitor;
+        }
+
+        CRXBuilder crsFile(final File crsFile) throws IOException {
+            crxBytes = Util.readFileBytes(crsFile);
+            return this;
+        }
+
+        CRXLibrary build() throws CancelledException, IOException,
+                VersionException, MemoryAccessException {
+            assert programFile != null;
+            assert monitor != null;
+            program = (Program) programFile
+                    // consumer, okToUpgrade, okToRecover
+                    .getDomainObject(this, true, false, monitor);
+
+            if (crxBytes == null) {
+                // Attempt to reconstruct bytes from program
+                crxBytes = Util.readProgramBytes(program);
             }
+            if (!hasCRO0Magic(this.crxBytes)) {
+                throw new InvalidCrxException(
+                        "Not a CRO0 file: Lacking CRO0 magic");
+            }
+
             int moduleNameSize = Util.getInt(this.crxBytes,
                     MODULE_NAME_SIZE_OFFSET);
             int moduleNameOffset = Util.getInt(this.crxBytes,
@@ -65,19 +102,27 @@ public final class CRXLibrary {
             this.name = Util.readCString(this.crxBytes,
                     moduleNameOffset, moduleNameSize);
             this.segments = SegmentBlock.fromCrx(crxBytes, program);
-        }
 
-        CRXLibrary build() {
-
-            return new CRXLibrary(this);
+            // Create crx, perform consumer hand-off
+            CRXLibrary crx = new CRXLibrary(this);
+            crx.program.addConsumer(crx);
+            crx.program.release(this);
+            return crx;
         }
 
         private static boolean hasCRO0Magic(final byte[] crxBytes) {
-            if (crxBytes == null) return false;
+            if (crxBytes == null) {
+                throw new NullPointerException();
+            }
             return Arrays.equals(crxBytes, CRO0_MAGIC_OFFSET,
                     CRO0_MAGIC_OFFSET + CRO0_MAGIC.length,
                     CRO0_MAGIC, 0, CRO0_MAGIC.length);
         }
+    }
+
+    /** @return the name of the module */
+    public String getName() {
+        return name;
     }
 
     /** @return Succinct information about the module as a String */
@@ -93,28 +138,40 @@ public final class CRXLibrary {
      *  using static.crs
      * @param codeFile The code.bin (static binary) file imported in Ghidra
      * @param crsFile The static.crs file (not imported)
-     * @param program The Ghidra Program containing code.bin
+     * @param monitor The Ghidra TaskMonitor
      * @return A CRXLibrary for the given code.bin Program
      */
     public static CRXLibrary fromStatic(final DomainFile codeFile,
                                         final File crsFile,
-                                        final Program program)
-            throws IOException {
-        CRXBuilder builder = new CRXBuilder(
-                Util.readFileBytes(crsFile), program);
-        return builder.build();
+                                        final TaskMonitor monitor)
+            throws IOException, CancelledException,
+            MemoryAccessException, VersionException {
+        return new CRXBuilder(codeFile, monitor)
+                .crsFile(crsFile)
+                .build();
     }
 
     /**
      * Construct a CRXLibrary from a relocatable object (.cro)
      * @param croFile The .cro file imported in Ghidra
-     * @param program The Ghidra Program containing said .cro
-     * @return A CRXLibrary for the given .cro Program
+     * @param monitor The Ghidra TaskMonitor
+     * @return A CRXLibrary for the given .cro
      */
-    static CRXLibrary fromRO(final DomainFile croFile, final Program program)
-            throws IOException, MemoryAccessException {
-        CRXBuilder builder = new CRXBuilder(
-                Util.readProgramBytes(program), program);
-        return builder.build();
+    public static CRXLibrary fromRO(final DomainFile croFile,
+                                    final TaskMonitor monitor)
+            throws IOException, MemoryAccessException,
+            CancelledException, VersionException {
+        return new CRXBuilder(croFile, monitor)
+                .build();
+    }
+
+    /**
+     * Acts as a destructor for CRXLibrary
+     */
+    @Override
+    public void close() throws Exception {
+        if (program != null) {
+            program.release(this);
+        }
     }
 }
