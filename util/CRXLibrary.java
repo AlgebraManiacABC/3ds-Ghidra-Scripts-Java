@@ -11,13 +11,18 @@ import java.util.Arrays;
 
 /**
  */
-final class CRXLibrary {
+public final class CRXLibrary {
 
     /** The file's magic identifier */
     private static final byte[] CRO0_MAGIC =
             "CRO0".getBytes(StandardCharsets.UTF_8);
     /** The file magic begins at 0x80, after the checksums */
     private static final int CRO0_MAGIC_OFFSET = 0x80;
+    /** Where in the crx file the module's name exists */
+    private static final int MODULE_NAME_OFFSET_OFFSET = 0xC0;
+    /** Where in the crx file the module's name's size is stored */
+    private static final int MODULE_NAME_SIZE_OFFSET = 0xC4;
+
 
     /** The name of the module, as used internally */
     private final String name;
@@ -43,27 +48,44 @@ final class CRXLibrary {
 
         /**
          * Constructs a builder for a CRXLibrary
-         * @param name The name of the library
+         *
          * @param crxBytes The real bytes of the original crx file
-         * @param program The Ghidra Program containing this library
+         * @param program  The Ghidra Program containing this library
          */
-        CRXBuilder(final String name, final byte[] crxBytes,
+        CRXBuilder(final byte[] crxBytes,
                    final Program program) throws IOException {
-            this.name = name;
             this.crxBytes = crxBytes;
+            if (!hasCRO0Magic(this.crxBytes)) {
+                throw new IOException("Not a CRO0 file: Lacking CRO0 magic");
+            }
+            int moduleNameSize = Util.getInt(this.crxBytes,
+                    MODULE_NAME_SIZE_OFFSET);
+            int moduleNameOffset = Util.getInt(this.crxBytes,
+                    MODULE_NAME_OFFSET_OFFSET);
+            this.name = Util.readCString(this.crxBytes,
+                    moduleNameOffset, moduleNameSize);
             this.segments = SegmentBlock.fromCrx(crxBytes, program);
         }
 
         CRXLibrary build() {
+
             return new CRXLibrary(this);
+        }
+
+        private static boolean hasCRO0Magic(final byte[] crxBytes) {
+            if (crxBytes == null) return false;
+            return Arrays.equals(crxBytes, CRO0_MAGIC_OFFSET,
+                    CRO0_MAGIC_OFFSET + CRO0_MAGIC.length,
+                    CRO0_MAGIC, 0, CRO0_MAGIC.length);
         }
     }
 
-    static boolean isValidCRO0(final byte[] crxBytes) {
-        if (crxBytes == null) return false;
-        return Arrays.equals(crxBytes, CRO0_MAGIC_OFFSET,
-                CRO0_MAGIC_OFFSET + Integer.BYTES,
-                CRO0_MAGIC, 0, CRO0_MAGIC.length);
+    /** @return Succinct information about the module as a String */
+    public String toString() {
+        return String.format(
+                "Module \"%s\"",
+                name
+        );
     }
 
     /**
@@ -74,9 +96,11 @@ final class CRXLibrary {
      * @param program The Ghidra Program containing code.bin
      * @return A CRXLibrary for the given code.bin Program
      */
-    static CRXLibrary fromStatic(final DomainFile codeFile, final File crsFile,
-                                 final Program program) throws IOException {
-        CRXBuilder builder = new CRXBuilder("|static|",
+    public static CRXLibrary fromStatic(final DomainFile codeFile,
+                                        final File crsFile,
+                                        final Program program)
+            throws IOException {
+        CRXBuilder builder = new CRXBuilder(
                 Util.readFileBytes(crsFile), program);
         return builder.build();
     }
@@ -90,10 +114,7 @@ final class CRXLibrary {
     static CRXLibrary fromRO(final DomainFile croFile, final Program program)
             throws IOException, MemoryAccessException {
         CRXBuilder builder = new CRXBuilder(
-                croFile.getName().split("\\.cro")[0],
-                Util.readProgramBytes(program),
-                program
-        );
+                Util.readProgramBytes(program), program);
         return builder.build();
     }
 }
