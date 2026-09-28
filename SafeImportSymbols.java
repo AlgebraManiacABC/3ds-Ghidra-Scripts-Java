@@ -18,6 +18,7 @@
 //@category 3DS
 //@menupath Tools.Safe Import Symbols CSV
 
+import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.NamespaceUtils;
 import ghidra.program.model.address.Address;
@@ -215,16 +216,27 @@ public class SafeImportSymbols extends GhidraScript {
     }
 
     private Function createFunctionAt(Address addr, long size) {
+        // A CSV may carry the Thumb bit in the entry address; the function goes at the
+        // even address, with the bit telling the disassembler which mode to decode in.
+        boolean thumb = (addr.getOffset() & 1) == 1;
+        Address entry = thumb ? addr.subtract(1) : addr;
         try {
+            // Disassemble first: function creation derives the body by following flow,
+            // so on undisassembled bytes it leaves a one-byte body that later
+            // disassembly never grows, and every body-based check downstream then reads
+            // the function as empty. See FixFunctionBodies, which exists to repair them.
+            if (currentProgram.getListing().getInstructionAt(entry) == null) {
+                new ArmDisassembleCommand(entry, null, thumb).applyTo(currentProgram, monitor);
+            }
             if (size > 0) {
-                AddressSet body = new AddressSet(addr, addr.add(size - 1));
+                AddressSet body = new AddressSet(entry, entry.add(size - 1));
                 // Named later, under the overwrite policy.
                 return currentProgram.getFunctionManager()
-                        .createFunction(null, addr, body, SOURCE);
+                        .createFunction(null, entry, body, SOURCE);
             }
-            return createFunction(addr, null);
+            return createFunction(entry, null);
         } catch (Exception e) {
-            println("Could not create a function at " + addr + " - " + e.getMessage());
+            println("Could not create a function at " + entry + " - " + e.getMessage());
             errors++;
             return null;
         }

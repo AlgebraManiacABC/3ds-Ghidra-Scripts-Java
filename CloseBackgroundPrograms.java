@@ -15,7 +15,7 @@ import java.util.List;
 
 public class CloseBackgroundPrograms extends GhidraScript {
 
-    private int discarded = 0, held = 0;
+    private int discarded = 0, held = 0, released = 0;
     private List<Program> toolPrograms = new ArrayList<>();
     private ProgramManager pman;
 
@@ -36,7 +36,8 @@ public class CloseBackgroundPrograms extends GhidraScript {
             toolPrograms = Arrays.asList(pman.getAllOpenPrograms());
         }
         walk(getState().getProject().getProjectData().getRootFolder());
-        printf("Discarded %d, %d still held.\n", discarded, held);
+        printf("Discarded %d, %d still held, %d leaked consumer(s) released.\n",
+                discarded, held, released);
     }
 
     private void walk(DomainFolder folder) {
@@ -56,11 +57,12 @@ public class CloseBackgroundPrograms extends GhidraScript {
     }
 
     private void close(DomainFile df, DomainObject obj) {
-        if (obj == currentProgram) return;
+        // The current program stays open: we only correct its refcount below.
+        boolean isCurrent = (obj == currentProgram);
 
         // Open in the tool: let the ProgramManager tear it down so the tool's
         // own bookkeeping (ProgramCache, plugins) stays consistent.
-        if (toolPrograms.contains(obj)) {
+        if (!isCurrent && toolPrograms.contains(obj)) {
             pman.closeProgram((Program) obj, true);
             println("  closed in tool: " + df.getName());
             return;
@@ -73,9 +75,21 @@ public class CloseBackgroundPrograms extends GhidraScript {
             if (isOurs(c)) ours.add(c);
         }
         // Non-saveable first: kills the save prompt and recovery snapshots.
-        if (!ours.isEmpty()) obj.setTemporary(true);
+        // Never for the current program -- it has to stay saveable.
+        if (!ours.isEmpty() && !isCurrent) obj.setTemporary(true);
         for (Object c : ours) {
             obj.release(c);
+            released++;
+        }
+
+        // Leaks on the current program are a refcount fix, not a close: the
+        // tool still holds it, so the usual discarded/held tally means nothing.
+        if (isCurrent) {
+            if (!ours.isEmpty()) {
+                printf("  cleaned %d leaked consumer(s) on current program: %s %s\n",
+                        ours.size(), df.getName(), ours);
+            }
+            return;
         }
 
         List<?> remaining = obj.getConsumerList();

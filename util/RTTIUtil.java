@@ -125,16 +125,23 @@ public class RTTIUtil {
             "N10__cxxabiv121__vmi_class_type_infoE", "__vmi_class_type_info"
     );
 
+    // The same names the other way round, so a discovered cxxabi class can be spelled
+    // back into the _ZTV / _ZTI labels that go on its vtable head and typeinfo struct.
+    private static final Map<String, String> CXXABI_TYPE_NAMES = new HashMap<>();
+    static {
+        for (Map.Entry<String, String> entry : CXXABI_MANGLED_NAMES.entrySet()) {
+            CXXABI_TYPE_NAMES.put(entry.getValue(), entry.getKey());
+        }
+    }
+
     private Map<Address, String> scanForTypeInfoRefs(Program program) throws Exception {
         Map<Address, String> refs = new HashMap<>();
         Memory mem = program.getMemory();
-        MemoryBlock rodata = findRodataBlock(program);
-        if (rodata == null) {
-            script.printerr("Could not find .rodata block!");
+        List<MemoryBlock> roBlocks = readOnlyBlocks(program);
+        if (roBlocks.isEmpty()) {
+            script.printerr("Could not find any read-only data block!");
             return null;
         }
-        Address startOff = rodata.getStart();
-        Address endOff = rodata.getEnd();
 
         // First pass: find all typeinfo string bases
         Map<Address, String> typeInfoNameAddrs = new HashMap<>();
@@ -153,11 +160,21 @@ public class RTTIUtil {
         Map<Address, String> typeinfoStructAddrs = new HashMap<>();
         for (var base : typeInfoNameAddrs.entrySet()) {
             long namePtr = base.getKey().getOffset();
-            for (Address off = startOff; off.add(PTR_SIZE).compareTo(endOff) <= 0; off = off.add(PTR_SIZE)) {
+            for (MemoryBlock block : roBlocks) {
+              Address endOff = block.getEnd();
+              for (Address off = block.getStart();
+                   off.add(PTR_SIZE).compareTo(endOff) <= 0; off = off.add(PTR_SIZE)) {
                 long here = mem.getInt(off);
                 if (here != namePtr) continue;
                 // Otherwise, this is a reference to the typeinfo-name.
                 typeinfoStructAddrs.put(off.subtract(4), base.getValue());
+                // The struct is this cxxabi class's own typeinfo: _ZTI names it
+                String typeName = CXXABI_TYPE_NAMES.get(base.getValue());
+                if (typeName != null) {
+                    MangledNames.addMangled(script, program, off.subtract(4),
+                            "_ZTI" + typeName);
+                }
+              }
             }
         }
 
@@ -165,7 +182,10 @@ public class RTTIUtil {
         SymbolTable symTab = program.getSymbolTable();
         for (Map.Entry<Address,String> entry : typeinfoStructAddrs.entrySet()) {
             long tiPtr = entry.getKey().getOffset();
-            for (Address off = startOff; off.add(PTR_SIZE).compareTo(endOff) <= 0; off = off.add(PTR_SIZE)) {
+            for (MemoryBlock block : roBlocks) {
+              Address endOff = block.getEnd();
+              for (Address off = block.getStart();
+                   off.add(PTR_SIZE).compareTo(endOff) <= 0; off = off.add(PTR_SIZE)) {
                 long here = mem.getInt(off);
                 if (here != tiPtr) continue;
                 // Otherwise, this is a reference to the typeinfo struct!
@@ -174,10 +194,20 @@ public class RTTIUtil {
                     // which is off+4 here. off itself (vtable+4, the vtable's own typeinfo
                     // slot) is never stored anywhere, so registering it only adds noise.
                     refs.put(off.add(4), entry.getValue());
-                    // Label the head and first ptr
+                    // Two labels, two conventions: the namespaced "vtable" marks the
+                    // head (the _ZTV address, where the vtable struct starts), while the
+                    // flat "X_vtable" marks the address point, which is the value
+                    // scanForTypeinfoStructs matches against typeinfo vptr words.
                     symTab.createLabel(off.add(4),entry.getValue() + "_vtable", SourceType.USER_DEFINED);
                     symTab.createLabel(off.subtract(4),entry.getValue() + "::vtable", SourceType.USER_DEFINED);
+                    // ...and the head's mangled spelling, beside the "::vtable" label
+                    String typeName = CXXABI_TYPE_NAMES.get(entry.getValue());
+                    if (typeName != null) {
+                        MangledNames.addMangled(script, program, off.subtract(4),
+                                "_ZTV" + typeName);
+                    }
                 }
+              }
             }
         }
 
@@ -226,7 +256,15 @@ public class RTTIUtil {
             }
         }
 
-        // Search external references
+        // Nothing above works on a module whose __cxxabiv1 name strings are absent -- a
+        // .cro that inherits them from code.bin, or a build that dropped them. Structure
+        // alone still gives them up.
+        frequencyScanForAbiVtables(program);
+
+        // Search external references. With a tool the modules come from its ProgramManager;
+        // headless they are opened from the project directly (Programs.open).
+        ProgramManager pman = Programs.manager(script);
+
         ReferenceManager refMan = program.getReferenceManager();
         ReferenceIterator refIter = refMan.getExternalReferences();
         while (refIter.hasNext()) {
@@ -235,23 +273,260 @@ public class RTTIUtil {
                 ExternalManager extMan = program.getExternalManager();
                 String extPath = extMan.getExternalLibraryPath(extRef.getLibraryName());
                 DomainFile extFile = script.parseDomainFile(extPath);
-                ProgramManager pman = script.getState().getTool().getService(ProgramManager.class);
-                Program extProg = pman.openCachedProgram(extFile, this);
-                Address extAddr = extRef.getExternalLocation().getAddress();
-                Symbol[] syms = extProg.getSymbolTable().getSymbols(extAddr);
-                for (Symbol sym : syms) {
-                    String extName = sym.getName();
-                    String rttiType = classifySymbolName(extName);
-                    if (rttiType == null) {
-                        continue;
-                    }
-                    if (!cxxabiVtableAddrs.computeIfAbsent(extProg.getName(),
-                            s -> new HashMap<>()).containsKey(extAddr)) {
-                        cxxabiVtableAddrs.get(extProg.getName()).put(extAddr, rttiType);
-                    }
+                Program extProg;
+                try {
+                    extProg = Programs.open(extFile, this, pman, script.getMonitor());
+                } catch (Exception e) {
+                    continue;
                 }
-                extProg.release(this);
+                if (extProg == null) continue;
+                // Held as a consumer until released, so anything thrown in between leaves
+                // the module pinned open for the rest of the session.
+                try {
+                    Address extAddr = extRef.getExternalLocation().getAddress();
+                    Symbol[] syms = extProg.getSymbolTable().getSymbols(extAddr);
+                    for (Symbol sym : syms) {
+                        String extName = sym.getName();
+                        String rttiType = classifySymbolName(extName);
+                        if (rttiType == null) {
+                            continue;
+                        }
+                        if (!cxxabiVtableAddrs.computeIfAbsent(extProg.getName(),
+                                s -> new HashMap<>()).containsKey(extAddr)) {
+                            cxxabiVtableAddrs.get(extProg.getName()).put(extAddr, rttiType);
+                        }
+                    }
+                } finally {
+                    extProg.release(this);
+                }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    //  Step 1b: Find them again, from structure alone
+    // ---------------------------------------------------------------
+
+    /** Below this many sharers a candidate is tail noise, not an ABI vtable. */
+    private static final int MIN_ABI_VTABLE_USERS = 16;
+
+    /** Largest {@code __vmi_class_type_info::__base_count} treated as plausible. */
+    private static final int MAX_PLAUSIBLE_BASE_COUNT = 64;
+
+    /**
+     * The three {@code __cxxabiv1} typeinfo vtables, found without a single symbol or
+     * name string.
+     *
+     * <p>Every typeinfo structure begins with a pointer to one of exactly three shared ABI
+     * vtables, followed by a pointer to its {@code _ZTS} name string. Nothing else in an
+     * image repeats that shape -- two consecutive read-only pointers, the first one shared
+     * -- thousands of times over, so counting the first words across read-only data lifts
+     * the three clear of a long tail of ordinary data.
+     *
+     * <p>Telling the three apart then needs no names either. A {@code __si_class_type_info}
+     * structure is 12 bytes and its word 2 is the one base's typeinfo, so nearly every
+     * user of the {@code __si} vtable has a word 2 that is itself a typeinfo -- that is the
+     * discriminator, and it is decisive (2220 of 2225 on the measured image). Of the other
+     * two, {@code __vmi} users carry a small flags word at word 2 and a small base count at
+     * word 3, each followed by that many resolvable base entries; {@code __class} users are
+     * 8 bytes and have nothing dependable there at all.
+     *
+     * <p>Only runs when the name-string and symbol routes have not already produced all
+     * three, and never overwrites what they found.
+     */
+    private void frequencyScanForAbiVtables(Program program) {
+        Map<Address, String> known = cxxabiVtableAddrs.computeIfAbsent(
+                program.getName(), s -> new HashMap<>());
+        if (new HashSet<>(known.values()).size() >= 3) return;
+
+        List<MemoryBlock> roBlocks = readOnlyBlocks(program);
+        if (roBlocks.isEmpty()) return;
+        RoImage ro = new RoImage(roBlocks, program.getMemory().isBigEndian());
+
+        // Pass 1: count. Two passes rather than one so the user lists, which are only
+        // wanted for three values, never have to be held for every value in the image.
+        Map<Long, Integer> counts = new HashMap<>();
+        for (MemoryBlock block : roBlocks) {
+            long start = block.getStart().getOffset();
+            long end = block.getEnd().getOffset();
+            for (long p = start; p + 2L * PTR_SIZE <= end + 1; p += PTR_SIZE) {
+                Long v = ro.wordAt(p);
+                if (v == null || !ro.contains(v)) continue;
+                Long next = ro.wordAt(p + PTR_SIZE);
+                if (next == null || !ro.contains(next)) continue;
+                counts.merge(v, 1, Integer::sum);
+            }
+        }
+
+        List<Map.Entry<Long, Integer>> ranked = new ArrayList<>(counts.entrySet());
+        ranked.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+
+        script.println("    Frequency scan for __cxxabiv1 vtables -- most-shared first " +
+                "words in read-only data:");
+        for (int i = 0; i < Math.min(5, ranked.size()); i++) {
+            script.println(String.format("      0x%08x  shared by %d structures%s",
+                    ranked.get(i).getKey(), ranked.get(i).getValue(),
+                    i == 3 ? "   <- tail begins here if the scan worked" : ""));
+        }
+        if (ranked.size() < 3 || ranked.get(2).getValue() < MIN_ABI_VTABLE_USERS) {
+            script.println("    ...no three candidates stand out; leaving the __cxxabiv1 " +
+                    "vtables unresolved for this module");
+            return;
+        }
+
+        List<Long> candidates = List.of(ranked.get(0).getKey(), ranked.get(1).getKey(),
+                ranked.get(2).getKey());
+        Set<Long> candidateSet = new HashSet<>(candidates);
+
+        // Pass 2: gather the users of just those three and score each candidate.
+        Map<Long, List<Long>> users = new HashMap<>();
+        for (MemoryBlock block : roBlocks) {
+            long start = block.getStart().getOffset();
+            long end = block.getEnd().getOffset();
+            for (long p = start; p + 2L * PTR_SIZE <= end + 1; p += PTR_SIZE) {
+                Long v = ro.wordAt(p);
+                if (v == null || !candidateSet.contains(v)) continue;
+                Long next = ro.wordAt(p + PTR_SIZE);
+                if (next == null || !ro.contains(next)) continue;
+                users.computeIfAbsent(v, k -> new ArrayList<>()).add(p);
+            }
+        }
+
+        Map<Long, Double> siScore = new HashMap<>();
+        Map<Long, Double> vmiScore = new HashMap<>();
+        for (long c : candidates) {
+            List<Long> us = users.getOrDefault(c, List.of());
+            int si = 0, vmi = 0;
+            for (long p : us) {
+                if (pointsAtTypeinfo(ro, candidateSet, p + 2L * PTR_SIZE)) si++;
+                if (readsAsVmiBody(ro, candidateSet, p)) vmi++;
+            }
+            siScore.put(c, us.isEmpty() ? 0.0 : (double) si / us.size());
+            vmiScore.put(c, us.isEmpty() ? 0.0 : (double) vmi / us.size());
+        }
+
+        // The __si vtable is the one whose users overwhelmingly name a base; of what is
+        // left, the __vmi vtable is the one whose users read as flags + base array.
+        long si = candidates.stream().max(Comparator.comparingDouble(siScore::get)).orElseThrow();
+        List<Long> rest = new ArrayList<>(candidates);
+        rest.remove(si);
+        long vmi = rest.stream().max(Comparator.comparingDouble(vmiScore::get)).orElseThrow();
+        rest.remove(vmi);
+        long plain = rest.get(0);
+
+        // Frequency alone is not enough: a module with no RTTI of its own still has shared
+        // words, e.g. a table of string pointers (HugeBattle.cro in MLDT, whose top three
+        // were odd addresses scoring 0% on both tests). A real ABI vtable is word-aligned,
+        // and its __si users overwhelmingly name a base.
+        boolean aligned = candidates.stream().allMatch(c -> c % PTR_SIZE == 0);
+        if (!aligned || siScore.get(si) < 0.5) {
+            script.println(String.format("    ...top candidates are not typeinfo vtables " +
+                    "(%s, best base-naming %.0f%%); leaving the __cxxabiv1 vtables unresolved " +
+                    "for this module", aligned ? "aligned" : "misaligned",
+                    100 * siScore.get(si)));
+            return;
+        }
+
+        Map<Long, String> roles = new LinkedHashMap<>();
+        roles.put(plain, "__class_type_info");
+        roles.put(si, "__si_class_type_info");
+        roles.put(vmi, "__vmi_class_type_info");
+
+        AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+        Set<String> takenRoles = new HashSet<>(known.values());
+        for (Map.Entry<Long, String> e : roles.entrySet()) {
+            Address addr = space.getAddress(e.getKey());
+            script.println(String.format("      0x%08x -> %-22s (base-naming %.0f%%, " +
+                            "vmi-shaped %.0f%%, %d users)",
+                    e.getKey(), e.getValue(), 100 * siScore.get(e.getKey()),
+                    100 * vmiScore.get(e.getKey()),
+                    users.getOrDefault(e.getKey(), List.of()).size()));
+            if (known.containsKey(addr) || takenRoles.contains(e.getValue())) continue;
+            known.put(addr, e.getValue());
+            takenRoles.add(e.getValue());
+        }
+    }
+
+    /** True when the word at {@code at} points at a structure headed by an ABI vtable. */
+    private boolean pointsAtTypeinfo(RoImage ro, Set<Long> abiVtables, long at) {
+        Long ptr = ro.wordAt(at);
+        if (ptr == null) return false;
+        Long head = ro.wordAt(ptr);
+        return head != null && abiVtables.contains(head);
+    }
+
+    /**
+     * True when the structure at {@code p} reads as a {@code __vmi_class_type_info}: a
+     * small flags word, a small base count, and that many resolvable base entries.
+     */
+    private boolean readsAsVmiBody(RoImage ro, Set<Long> abiVtables, long p) {
+        Long flags = ro.wordAt(p + 2L * PTR_SIZE);
+        Long count = ro.wordAt(p + 3L * PTR_SIZE);
+        if (flags == null || count == null) return false;
+        if (flags > 3) return false;                       // only bits 0 and 1 are defined
+        if (count < 1 || count > MAX_PLAUSIBLE_BASE_COUNT) return false;
+        for (long i = 0; i < count; i++) {
+            if (!pointsAtTypeinfo(ro, abiVtables, p + 4L * PTR_SIZE + 8 * i)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * The read-only blocks held as bytes, so a whole-image sweep costs one read per block
+     * instead of two million calls into {@link Memory}.
+     */
+    private static final class RoImage {
+        private final long[] starts;
+        private final byte[][] bytes;
+        private final boolean bigEndian;
+
+        RoImage(List<MemoryBlock> blocks, boolean bigEndian) {
+            this.bigEndian = bigEndian;
+            List<Long> s = new ArrayList<>();
+            List<byte[]> b = new ArrayList<>();
+            for (MemoryBlock block : blocks) {
+                try {
+                    int size = (int) Math.min(block.getSize(), Integer.MAX_VALUE);
+                    byte[] buf = new byte[size];
+                    int read = block.getBytes(block.getStart(), buf);
+                    if (read <= 0) continue;
+                    s.add(block.getStart().getOffset());
+                    b.add(read == size ? buf : Arrays.copyOf(buf, read));
+                } catch (Exception e) {
+                    // An unreadable block contributes nothing; the others still count.
+                }
+            }
+            starts = new long[s.size()];
+            for (int i = 0; i < s.size(); i++) starts[i] = s.get(i);
+            bytes = b.toArray(new byte[0][]);
+        }
+
+        /** True when a whole word can be read at {@code addr}. */
+        boolean contains(long addr) {
+            return blockOf(addr) >= 0;
+        }
+
+        /** The word at {@code addr}, unsigned, or null when it is not inside a block. */
+        Long wordAt(long addr) {
+            int i = blockOf(addr);
+            if (i < 0) return null;
+            int o = (int) (addr - starts[i]);
+            byte[] buf = bytes[i];
+            int v = bigEndian
+                    ? ((buf[o] & 0xff) << 24) | ((buf[o + 1] & 0xff) << 16)
+                            | ((buf[o + 2] & 0xff) << 8) | (buf[o + 3] & 0xff)
+                    : (buf[o] & 0xff) | ((buf[o + 1] & 0xff) << 8)
+                            | ((buf[o + 2] & 0xff) << 16) | ((buf[o + 3] & 0xff) << 24);
+            return Integer.toUnsignedLong(v);
+        }
+
+        private int blockOf(long addr) {
+            for (int i = 0; i < starts.length; i++) {
+                if (addr >= starts[i] && addr + PTR_SIZE <= starts[i] + bytes[i].length) {
+                    return i;
+                }
+            }
+            return -1;
         }
     }
 
@@ -290,9 +565,20 @@ public class RTTIUtil {
         // _ZTI = typeinfo struct, _ZTS = typeinfo name string, and Ghidra's demangled
         // forms of those end in "typeinfo" / "typeinfo-name".
         if (name.startsWith("_ZTI") || name.startsWith("_ZTS")) return false;
+        // _ZTT = VTT; _ZT_C1_ / _ZT_B1_ are ARMCC's construction-vtable forms and _ZTC is
+        // Itanium's spelling for the same thing. None of these is a
+        // __cxxabiv1 class's vtable, and letting one through would have its address
+        // scanned for as though every word pointing at it were a typeinfo struct.
+        if (name.startsWith("_ZTT") || name.startsWith("_ZTC")
+                || name.startsWith("_ZT_C1_") || name.startsWith("_ZT_B1_")) {
+            return false;
+        }
         int sep = name.lastIndexOf("::");
         String last = (sep < 0) ? name : name.substring(sep + 2);
         if (last.equals("typeinfo") || last.equals("typeinfo-name")) return false;
+        // The VTT label this pipeline writes sits in a class namespace as "VTT"; it is
+        // deliberately not spelled with "vtable" in it, but reject it explicitly too.
+        if (last.equals("VTT")) return false;
 
         // _ZTV = vtable; "vtable" also covers the demangled form and the
         // "X_vtable" / "X::vtable" labels created by scanForTypeInfoRefs.
@@ -305,19 +591,19 @@ public class RTTIUtil {
 
     private void scanForTypeinfoStructs(Program program) throws Exception {
         Memory mem = program.getMemory();
-        MemoryBlock rodata = findRodataBlock(program);
-        if (rodata == null) {
-            script.printerr("Could not find .rodata block!");
+        List<MemoryBlock> roBlocks = readOnlyBlocks(program);
+        if (roBlocks.isEmpty()) {
+            script.printerr("Could not find any read-only data block!");
             return;
         }
-        Address start = rodata.getStart();
-        Address end = rodata.getEnd();
-        long startOff = start.getOffset();
-        long endOff = end.getOffset();
 
         AddressSpace addressSpace = program.getAddressFactory().getDefaultAddressSpace();
         // Scan every 4-byte-aligned address for values matching __cxxabiv1 vtable addresses
-        for (long off = startOff; off + PTR_SIZE <= endOff + 1; off += PTR_SIZE) {
+        for (MemoryBlock block : roBlocks) {
+          Address start = block.getStart();
+          long startOff = start.getOffset();
+          long endOff = block.getEnd().getOffset();
+          for (long off = startOff; off + PTR_SIZE <= endOff + 1; off += PTR_SIZE) {
             Address addr = start.getNewAddress(off);
 
             long value = Integer.toUnsignedLong(mem.getInt(addr));
@@ -336,6 +622,7 @@ public class RTTIUtil {
                     discoveredTypeinfos.put(off, rttiType);
                 }
             }
+          }
         }
     }
 
@@ -365,21 +652,38 @@ public class RTTIUtil {
         return null;
     }
 
-    private MemoryBlock findRodataBlock(Program program) {
-        Memory mem = program.getMemory();
-        for (MemoryBlock block : mem.getBlocks()) {
+    /**
+     * Every block that may hold typeinfo, vtables or name strings.
+     *
+     * <p>Typeinfo discovery is a sweep of every word-aligned read-only address, so it has
+     * to see <em>all</em> of them: an image with its const data split across several
+     * blocks would otherwise have whole subtrees of the class graph silently missing.
+     * Returning the first {@code .rodata} block, as this used to, was that bug.
+     *
+     * <p>The fallback deliberately does not test {@code isWrite()}. On 3DS images the
+     * const data is frequently mapped writable -- {@code .rodata} on ACNL is -- so a
+     * writability test rejects exactly the block being looked for. {@code isInitialized()}
+     * is the test that matters, since an uninitialized block has no bytes to read.
+     *
+     * <p>Kept identical to {@link VtableScan}'s own block selection on purpose: the two
+     * sweeps have to agree on where const data is, or a vtable is found in a block whose
+     * typeinfo was never discovered.
+     */
+    private List<MemoryBlock> readOnlyBlocks(Program program) {
+        List<MemoryBlock> blocks = new ArrayList<>();
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
             String name = block.getName();
             if (name.equals(".rodata") || name.equals("rodata")) {
-                return block;
+                blocks.add(block);
             }
         }
-        // Fallback: look for a read-only, non-executable block
-        for (MemoryBlock block : mem.getBlocks()) {
-            if (block.isRead() && !block.isWrite() && !block.isExecute()) {
-                return block;
+        if (!blocks.isEmpty()) return blocks;
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
+            if (block.isInitialized() && block.isRead() && !block.isExecute()) {
+                blocks.add(block);
             }
         }
-        return null;
+        return blocks;
     }
 
     // ---------------------------------------------------------------
@@ -532,17 +836,42 @@ public class RTTIUtil {
             createClassTypeInfo(dtm, ptrSize);
             createSiClassTypeInfo(dtm, ptrSize);
 
-            // Determine max base count needed
+            // Determine max base count needed. A __vmi candidate whose flags or base count
+            // is out of range is not a __vmi_class_type_info: sizing a struct from its
+            // count would lay millions of bytes of array over the image.
             Set<Integer> baseCounts = new HashSet<>();
             Memory mem = program.getMemory();
             AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+            List<Long> badVmi = new ArrayList<>();
+            int vmiTotal = 0;
             for (Map.Entry<Long, String> entry : discoveredTypeinfos.entrySet()) {
                 if (entry.getValue().equals("__vmi_class_type_info")) {
+                    vmiTotal++;
                     Address addr = space.getAddress(entry.getKey());
+                    int flags = mem.getInt(addr.add(8));
                     int baseCount = mem.getInt(addr.add(12));
-//                    script.printf("    __vmi base_count = %d at 0x%08x\n", baseCount, entry.getKey());
+                    if (flags < 0 || flags > 3
+                            || baseCount < 1 || baseCount > MAX_PLAUSIBLE_BASE_COUNT) {
+                        script.printf("    WARNING: __vmi typeinfo at 0x%08x has flags 0x%x, " +
+                                "base count %d; dropping as false positive\n",
+                                entry.getKey(), flags, baseCount);
+                        badVmi.add(entry.getKey());
+                        continue;
+                    }
                     baseCounts.add(baseCount);
                 }
+            }
+            for (long tiAddr : badVmi) {
+                discoveredTypeinfos.remove(tiAddr);
+            }
+            // Many failures at once means the __vmi vtable itself is misidentified (most
+            // likely swapped with __class, whose 8-byte structs leave word 3 as whatever
+            // follows), not that a few candidates are noise.
+            if (vmiTotal > 0 && badVmi.size() * 4 > vmiTotal) {
+                script.printerr(String.format("RTTI: %d of %d __vmi typeinfo candidates in %s " +
+                        "failed the flags/base-count check -- the __cxxabiv1 vtable roles are " +
+                        "probably misassigned for this module", badVmi.size(), vmiTotal,
+                        program.getName()));
             }
             for (int count : baseCounts) {
                 createVmiClassTypeInfo(dtm, ptrSize, count);
@@ -706,6 +1035,13 @@ public class RTTIUtil {
                     program.getSymbolTable().createLabel(addr, "typeinfo",
                             parentNs, SourceType.USER_DEFINED);
                 }
+                // The mangled spelling goes beside it, whether or not the label is new,
+                // so a re-run backfills programs processed before this existed. The _ZTS
+                // string at __name is the compiler's own, so no re-mangling is needed.
+                String enc = MangledNames.typeNameFromNameString(program, namePtrAddr);
+                if (enc != null) {
+                    MangledNames.addMangled(script, program, addr, "_ZTI" + enc);
+                }
 //                script.println("    " + parentNs.getName(true) + "::typeinfo at 0x" +
 //                        Long.toHexString(tiAddrOff));
             }
@@ -718,9 +1054,9 @@ public class RTTIUtil {
 
     private void discoverVtables(Program program) throws Exception {
         Memory mem = program.getMemory();
-        MemoryBlock rodata = findRodataBlock(program);
-        if (rodata == null) {
-            script.printerr("Could not find .rodata block!");
+        List<MemoryBlock> roBlocks = readOnlyBlocks(program);
+        if (roBlocks.isEmpty()) {
+            script.printerr("Could not find any read-only data block!");
             return;
         }
 
@@ -736,12 +1072,11 @@ public class RTTIUtil {
             }
         }
 
-        Address start = rodata.getStart();
-        Address end = rodata.getEnd();
-        long startOff = start.getOffset();
-        long endOff = end.getOffset();
-
-        for (long off = startOff; off + PTR_SIZE <= endOff + 1; off += PTR_SIZE) {
+        for (MemoryBlock block : roBlocks) {
+          Address start = block.getStart();
+          long startOff = start.getOffset();
+          long endOff = block.getEnd().getOffset();
+          for (long off = startOff; off + PTR_SIZE <= endOff + 1; off += PTR_SIZE) {
             if (excludedAddrs.contains(off)) continue;
 
             Address addr = start.getNewAddress(off);
@@ -750,6 +1085,7 @@ public class RTTIUtil {
             if (typeinfoAddrSet.contains(value)) {
                 vtableRttiSlots.put(off, value);
             }
+          }
         }
     }
 }

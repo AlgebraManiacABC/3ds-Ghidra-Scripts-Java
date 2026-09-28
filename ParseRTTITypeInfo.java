@@ -10,6 +10,7 @@ import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.symbol.*;
 import ghidra.program.model.mem.Memory;
+import util.MangledNames;
 
 import java.util.*;
 
@@ -187,6 +188,12 @@ public class ParseRTTITypeInfo extends GhidraScript {
                 createLabel(addr, "typeinfo", parentNs, true, SourceType.USER_DEFINED);
             }
             println("  -> " + parentNs.getName(true) + "::typeinfo");
+
+            // The mangled spelling beside it, taken from the _ZTS string at __name
+            String enc = MangledNames.typeNameFromNameString(currentProgram, namePtrAddr);
+            if (enc != null && MangledNames.addMangled(this, currentProgram, addr, "_ZTI" + enc)) {
+                println("  -> _ZTI" + enc);
+            }
         } else {
             println("  WARNING: No namespaced symbol found at name pointer " + namePtrAddr);
             println("  Could not determine class name for labeling.");
