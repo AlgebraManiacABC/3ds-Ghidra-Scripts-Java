@@ -67,8 +67,7 @@ public final class CRXLibrary implements AutoCloseable {
          * @param programFile The Ghidra DomainFile associated with this module
          * @param monitor The Ghidra Task Monitor
          */
-        CRXBuilder(final DomainFile programFile, final TaskMonitor monitor)
-                throws IOException {
+        CRXBuilder(final DomainFile programFile, final TaskMonitor monitor) {
             this.programFile = programFile;
             this.monitor = monitor;
         }
